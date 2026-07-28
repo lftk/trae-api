@@ -10,13 +10,13 @@
 go install github.com/lftk/trae-api@latest
 ```
 
-请确保 Go 的 `bin` 目录已加入 `PATH`，然后运行：
+## 使用
+
+启动服务：
 
 ```bash
 trae-api
 ```
-
-## 使用
 
 默认监听 `127.0.0.1:8723`。
 
