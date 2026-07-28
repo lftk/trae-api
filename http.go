@@ -1,0 +1,185 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"time"
+
+	openai "github.com/sashabaranov/go-openai"
+)
+
+func (s *server) chat(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req openai.ChatCompletionRequest
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid chat completion request: "+err.Error())
+		return
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		writeError(w, http.StatusBadRequest, "invalid chat completion request: multiple JSON values")
+		return
+	}
+	if len(req.Messages) == 0 {
+		writeError(w, http.StatusBadRequest, "invalid chat completion request: messages is required")
+		return
+	}
+	if err := validateMessages(req.Messages); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid chat completion request: "+err.Error())
+		return
+	}
+	if req.Model == "" {
+		req.Model = s.cfg.DefaultModel
+	}
+	id := r.Header.Get("X-Session-ID")
+	session, id, err := s.session(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	selectedModel, err := session.setModel(r.Context(), req.Model)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if selectedModel != "" {
+		req.Model = selectedModel
+	}
+	prompt := formatPrompt(req.Messages)
+	if req.Stream {
+		s.streamChat(w, r, session, id, req.Model, prompt)
+		return
+	}
+	answer, reasoning, err := session.prompt(r.Context(), prompt, nil)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	w.Header().Set("X-Session-ID", id)
+	writeJSONOrLog(w, http.StatusOK, openai.ChatCompletionResponse{ID: "chatcmpl-" + id, Object: "chat.completion", Created: time.Now().Unix(), Model: req.Model, Choices: []openai.ChatCompletionChoice{{Index: 0, Message: openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant, Content: answer, ReasoningContent: reasoning}, FinishReason: openai.FinishReasonStop}}})
+	slog.Info("chat completed", "session", id, "elapsed", time.Since(started))
+}
+
+func (s *server) streamChat(w http.ResponseWriter, r *http.Request, session *traeSession, id, model, prompt string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Session-ID", id)
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "streaming is not supported")
+		return
+	}
+	completionID := "chatcmpl-" + id
+	var streamErr error
+	var sawAnswer bool
+	tryWrite := func(value any) bool {
+		if streamErr != nil {
+			return false
+		}
+		if err := writeSSE(w, value); err != nil {
+			streamErr = err
+			return false
+		}
+		return true
+	}
+	initial := openai.ChatCompletionStreamResponse{ID: completionID, Object: "chat.completion.chunk", Created: time.Now().Unix(), Model: model, Choices: []openai.ChatCompletionStreamChoice{{Index: 0, Delta: openai.ChatCompletionStreamChoiceDelta{Role: openai.ChatMessageRoleAssistant}, FinishReason: openai.FinishReasonNull}}}
+	if !tryWrite(initial) {
+		slog.Error("write chat completion stream", "error", streamErr)
+		return
+	}
+	flusher.Flush()
+	answer, _, err := session.prompt(r.Context(), prompt, func(item update) {
+		if streamErr != nil {
+			return
+		}
+		if !item.Reasoning {
+			sawAnswer = sawAnswer || item.Text != ""
+		}
+		chunk := openai.ChatCompletionStreamResponse{ID: completionID, Object: "chat.completion.chunk", Created: time.Now().Unix(), Model: model, Choices: []openai.ChatCompletionStreamChoice{{Index: 0, Delta: openai.ChatCompletionStreamChoiceDelta{}, FinishReason: openai.FinishReasonNull}}}
+		if item.Reasoning {
+			chunk.Choices[0].Delta.ReasoningContent = item.Text
+		} else {
+			chunk.Choices[0].Delta.Content = item.Text
+		}
+		if tryWrite(chunk) {
+			flusher.Flush()
+		}
+	})
+	if streamErr != nil {
+		slog.Error("write chat completion stream", "error", streamErr)
+		return
+	}
+	if err != nil {
+		tryWrite(openai.ErrorResponse{Error: &openai.APIError{Message: err.Error(), Type: "server_error"}})
+	} else {
+		// If ACP supplied only thought chunks, prompt() converts them to the
+		// answer after the stream callback has already run. Send that fallback
+		// answer now so a proxy/client does not finish with an empty response.
+		if !sawAnswer && answer != "" {
+			tryWrite(openai.ChatCompletionStreamResponse{ID: completionID, Object: "chat.completion.chunk", Created: time.Now().Unix(), Model: model, Choices: []openai.ChatCompletionStreamChoice{{Index: 0, Delta: openai.ChatCompletionStreamChoiceDelta{Content: answer}, FinishReason: openai.FinishReasonNull}}})
+		}
+		if tryWrite(openai.ChatCompletionStreamResponse{ID: completionID, Object: "chat.completion.chunk", Created: time.Now().Unix(), Model: model, Choices: []openai.ChatCompletionStreamChoice{{Index: 0, Delta: openai.ChatCompletionStreamChoiceDelta{}, FinishReason: openai.FinishReasonStop}}}) {
+			_, streamErr = io.WriteString(w, "data: [DONE]\n\n")
+		}
+	}
+	if streamErr != nil {
+		slog.Error("write chat completion stream", "error", streamErr)
+		return
+	}
+	flusher.Flush()
+}
+
+func (s *server) routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSONOrLog(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	mux.HandleFunc("GET /v1/models", s.models)
+	mux.HandleFunc("POST /v1/chat/completions", s.chat)
+	return authMiddleware(s.cfg.APIToken, mux)
+}
+func authMiddleware(token string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if token != "" && r.Header.Get("Authorization") != "Bearer "+token {
+			writeError(w, http.StatusUnauthorized, "invalid bearer token")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+func writeSSE(w io.Writer, value any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("marshal server-sent event: %w", err)
+	}
+	if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+		return fmt.Errorf("write server-sent event: %w", err)
+	}
+	return nil
+}
+func writeJSON(w http.ResponseWriter, status int, value any) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		return fmt.Errorf("encode JSON response: %w", err)
+	}
+	return nil
+}
+func writeError(w http.ResponseWriter, status int, message string) {
+	if err := writeJSON(w, status, openai.ErrorResponse{Error: &openai.APIError{Message: message, Type: "invalid_request_error"}}); err != nil {
+		slog.Error("write error response", "error", err)
+	}
+}
+func writeJSONOrLog(w http.ResponseWriter, status int, value any) {
+	if err := writeJSON(w, status, value); err != nil {
+		slog.Error("write JSON response", "error", err)
+	}
+}

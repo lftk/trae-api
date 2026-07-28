@@ -1,0 +1,119 @@
+package main
+
+import (
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+type config struct {
+	Addr                string
+	TraeBin             string
+	TraeArgs            []string
+	Workdir             string
+	WorkdirTemp         bool
+	APIToken            string
+	DefaultModel        string
+	SessionIdleTimeout  time.Duration
+	SessionScanInterval time.Duration
+	ShutdownTimeout     time.Duration
+}
+
+func loadConfig() (config, error) {
+	var err error
+	idleTimeout, err := durationFromEnv("TRAE_API_SESSION_IDLE_TIMEOUT", 15*time.Minute)
+	if err != nil {
+		return config{}, err
+	}
+	scanInterval, err := durationFromEnv("TRAE_API_SESSION_SCAN_INTERVAL", time.Minute)
+	if err != nil {
+		return config{}, err
+	}
+	shutdownTimeout, err := durationFromEnv("TRAE_API_SHUTDOWN_TIMEOUT", 30*time.Second)
+	if err != nil {
+		return config{}, err
+	}
+	workdir := os.Getenv("TRAE_API_WORKDIR")
+	workdirTemp := false
+	if workdir == "" {
+		workdir, err = os.MkdirTemp("", "trae-api-")
+		if err != nil {
+			return config{}, fmt.Errorf("create temporary work directory: %w", err)
+		}
+		workdirTemp = true
+	}
+	cfg := config{
+		Addr:                getenv("TRAE_API_ADDR", "127.0.0.1:8723"),
+		TraeBin:             getenv("TRAE_API_BIN", "trae-cli"),
+		TraeArgs:            strings.Fields(getenv("TRAE_API_ARGS", "acp serve --yolo")),
+		Workdir:             workdir,
+		WorkdirTemp:         workdirTemp,
+		APIToken:            os.Getenv("TRAE_API_TOKEN"),
+		DefaultModel:        getenv("TRAE_API_DEFAULT_MODEL", ""),
+		SessionIdleTimeout:  idleTimeout,
+		SessionScanInterval: scanInterval,
+		ShutdownTimeout:     shutdownTimeout,
+	}
+	if !isLoopbackAddr(cfg.Addr) && cfg.APIToken == "" {
+		if workdirTemp {
+			_ = os.RemoveAll(workdir)
+		}
+		return config{}, errors.New("TRAE_API_TOKEN is required when TRAE_API_ADDR is not loopback")
+	}
+	return cfg, nil
+}
+
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func resolveWorkdir(value string) (string, error) {
+	if value == "" {
+		return "", errors.New("project directory is required")
+	}
+	workdir, err := filepath.Abs(value)
+	if err != nil {
+		return "", fmt.Errorf("resolve project directory: %w", err)
+	}
+	info, err := os.Stat(workdir)
+	if err != nil {
+		return "", fmt.Errorf("stat project directory %q: %w", workdir, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("project directory is not a directory: %s", workdir)
+	}
+	return workdir, nil
+}
+
+func getenv(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func durationFromEnv(key string, fallback time.Duration) (time.Duration, error) {
+	if value := os.Getenv(key); value != "" {
+		if d, err := time.ParseDuration(value); err == nil {
+			if d <= 0 {
+				return 0, fmt.Errorf("%s must be greater than zero", key)
+			}
+			return d, nil
+		} else {
+			return 0, fmt.Errorf("parse %s: %w", key, err)
+		}
+	}
+	return fallback, nil
+}

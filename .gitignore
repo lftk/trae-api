@@ -30,3 +30,16 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Go build artifacts
+/trae-api
+
+# Local environment and editor files
+.env.*
+.DS_Store
+.idea/
+.vscode/
+
+# Coverage and profiling output
+coverage.out
+coverage.html
