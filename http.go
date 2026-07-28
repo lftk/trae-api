@@ -7,7 +7,9 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+	"unicode"
 
+	acp "github.com/coder/acp-go-sdk"
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -57,13 +59,16 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 		s.streamChat(w, r, session, id, req.Model, prompt)
 		return
 	}
-	answer, reasoning, err := session.prompt(r.Context(), prompt, nil)
+	answer, reasoning, usage, err := session.prompt(r.Context(), prompt, nil)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	if usage == nil {
+		w.Header().Set("X-Usage-Estimated", "true")
+	}
 	w.Header().Set("X-Session-ID", id)
-	writeJSONOrLog(w, http.StatusOK, openai.ChatCompletionResponse{ID: "chatcmpl-" + id, Object: "chat.completion", Created: time.Now().Unix(), Model: req.Model, Choices: []openai.ChatCompletionChoice{{Index: 0, Message: openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant, Content: answer, ReasoningContent: reasoning}, FinishReason: openai.FinishReasonStop}}})
+	writeJSONOrLog(w, http.StatusOK, openai.ChatCompletionResponse{ID: "chatcmpl-" + id, Object: "chat.completion", Created: time.Now().Unix(), Model: req.Model, Choices: []openai.ChatCompletionChoice{{Index: 0, Message: openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant, Content: answer, ReasoningContent: reasoning}, FinishReason: openai.FinishReasonStop}}, Usage: openAIUsage(usage, prompt, answer, reasoning)})
 	slog.Info("chat completed", "session", id, "elapsed", time.Since(started))
 }
 
@@ -96,7 +101,7 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, session *tra
 		return
 	}
 	flusher.Flush()
-	answer, _, err := session.prompt(r.Context(), prompt, func(item update) {
+	answer, reasoning, usage, err := session.prompt(r.Context(), prompt, func(item update) {
 		if streamErr != nil {
 			return
 		}
@@ -120,13 +125,23 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, session *tra
 	if err != nil {
 		tryWrite(openai.ErrorResponse{Error: &openai.APIError{Message: err.Error(), Type: "server_error"}})
 	} else {
+		if usage == nil {
+			w.Header().Set("X-Usage-Estimated", "true")
+		}
 		// If ACP supplied only thought chunks, prompt() converts them to the
 		// answer after the stream callback has already run. Send that fallback
 		// answer now so a proxy/client does not finish with an empty response.
 		if !sawAnswer && answer != "" {
 			tryWrite(openai.ChatCompletionStreamResponse{ID: completionID, Object: "chat.completion.chunk", Created: time.Now().Unix(), Model: model, Choices: []openai.ChatCompletionStreamChoice{{Index: 0, Delta: openai.ChatCompletionStreamChoiceDelta{Content: answer}, FinishReason: openai.FinishReasonNull}}})
 		}
-		if tryWrite(openai.ChatCompletionStreamResponse{ID: completionID, Object: "chat.completion.chunk", Created: time.Now().Unix(), Model: model, Choices: []openai.ChatCompletionStreamChoice{{Index: 0, Delta: openai.ChatCompletionStreamChoiceDelta{}, FinishReason: openai.FinishReasonStop}}}) {
+		final := openai.ChatCompletionStreamResponse{ID: completionID, Object: "chat.completion.chunk", Created: time.Now().Unix(), Model: model, Choices: []openai.ChatCompletionStreamChoice{{Index: 0, Delta: openai.ChatCompletionStreamChoiceDelta{}, FinishReason: openai.FinishReasonStop}}}
+		if usage != nil {
+			final.Usage = openAIUsagePtr(usage, prompt, answer, reasoning)
+		} else {
+			estimated := openAIUsage(usage, prompt, answer, reasoning)
+			final.Usage = &estimated
+		}
+		if tryWrite(final) {
 			_, streamErr = io.WriteString(w, "data: [DONE]\n\n")
 		}
 	}
@@ -135,6 +150,59 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, session *tra
 		return
 	}
 	flusher.Flush()
+}
+
+func openAIUsage(usage *acp.Usage, prompt, answer, reasoning string) openai.Usage {
+	if usage == nil {
+		promptTokens := estimateTokens(prompt)
+		completionTokens := estimateTokens(answer + reasoning)
+		return openai.Usage{PromptTokens: promptTokens, CompletionTokens: completionTokens, TotalTokens: promptTokens + completionTokens}
+	}
+	result := openai.Usage{PromptTokens: usage.InputTokens, CompletionTokens: usage.OutputTokens, TotalTokens: usage.TotalTokens}
+	if usage.CachedReadTokens != nil || usage.CachedWriteTokens != nil {
+		result.PromptTokensDetails = &openai.PromptTokensDetails{}
+		if usage.CachedReadTokens != nil {
+			result.PromptTokensDetails.CachedTokens = *usage.CachedReadTokens
+		}
+	}
+	if usage.ThoughtTokens != nil {
+		result.CompletionTokensDetails = &openai.CompletionTokensDetails{ReasoningTokens: *usage.ThoughtTokens}
+	}
+	return result
+}
+
+func openAIUsagePtr(usage *acp.Usage, prompt, answer, reasoning string) *openai.Usage {
+	if usage == nil {
+		return nil
+	}
+	result := openAIUsage(usage, prompt, answer, reasoning)
+	return &result
+}
+
+// estimateTokens is a provider-independent fallback for ACP agents that do
+// not return usage. It is intentionally conservative and is marked on the
+// response with X-Usage-Estimated; exact counts require the model tokenizer.
+func estimateTokens(text string) int {
+	count := 0
+	inWord := false
+	for _, r := range text {
+		switch {
+		case unicode.IsSpace(r):
+			inWord = false
+		case unicode.Is(unicode.Han, r) || unicode.IsPunct(r) || unicode.IsSymbol(r):
+			if inWord {
+				count++
+				inWord = false
+			}
+			count++
+		default:
+			inWord = true
+		}
+	}
+	if inWord {
+		count++
+	}
+	return count
 }
 
 func (s *server) routes() http.Handler {
