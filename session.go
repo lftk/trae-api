@@ -31,6 +31,11 @@ type traeSession struct {
 	onDone       func()
 }
 
+type promptResult struct {
+	usage *acp.Usage
+	err   error
+}
+
 func newSession(ctx context.Context, cfg config) (*traeSession, error) {
 	started := time.Now()
 	workdir, err := resolveWorkdir(cfg.Workdir)
@@ -144,12 +149,12 @@ func (s *traeSession) setModel(ctx context.Context, model string) (string, error
 	return "", fmt.Errorf("model %q is not advertised by trae", model)
 }
 
-func (s *traeSession) prompt(ctx context.Context, text string, stream func(update)) (string, string, error) {
+func (s *traeSession) prompt(ctx context.Context, text string, stream func(update)) (string, string, *acp.Usage, error) {
 	s.lastUsed = time.Now()
-	done := make(chan error, 1)
+	done := make(chan promptResult, 1)
 	go func() {
-		_, err := s.conn.Prompt(ctx, acp.PromptRequest{SessionId: s.session, Prompt: []acp.ContentBlock{acp.TextBlock(text)}})
-		done <- err
+		response, err := s.conn.Prompt(ctx, acp.PromptRequest{SessionId: s.session, Prompt: []acp.ContentBlock{acp.TextBlock(text)}})
+		done <- promptResult{usage: response.Usage, err: err}
 	}()
 	var answer, reasoning strings.Builder
 	consume := func(item update) {
@@ -166,9 +171,9 @@ func (s *traeSession) prompt(ctx context.Context, text string, stream func(updat
 		select {
 		case item := <-s.client.updates:
 			consume(item)
-		case err := <-done:
-			if err != nil {
-				return answer.String(), reasoning.String(), fmt.Errorf("prompt trae session: %w", err)
+		case result := <-done:
+			if result.err != nil {
+				return answer.String(), reasoning.String(), result.usage, fmt.Errorf("prompt trae session: %w", result.err)
 			}
 			// SessionUpdate handlers enqueue notifications before Prompt can
 			// return, but both the final update and the completion signal may
@@ -180,14 +185,14 @@ func (s *traeSession) prompt(ctx context.Context, text string, stream func(updat
 					consume(item)
 				case <-ctx.Done():
 					answerText, reasoningText := responseText(answer.String(), reasoning.String())
-					return answerText, reasoningText, ctx.Err()
+					return answerText, reasoningText, result.usage, ctx.Err()
 				default:
 					answerText, reasoningText := responseText(answer.String(), reasoning.String())
-					return answerText, reasoningText, nil
+					return answerText, reasoningText, result.usage, nil
 				}
 			}
 		case <-ctx.Done():
-			return answer.String(), reasoning.String(), ctx.Err()
+			return answer.String(), reasoning.String(), nil, ctx.Err()
 		}
 	}
 }
