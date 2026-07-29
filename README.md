@@ -48,7 +48,8 @@ curl http://127.0.0.1:8723/v1/chat/completions \
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 - 文本消息和流式响应（`"stream": true`）
-- 使用响应头 `X-Session-ID` 复用会话，session ID 为随机 UUID
+- 使用请求头 `X-Session-ID` 复用会话，session ID 为随机 UUID
+- Claude Code 可直接使用其 `X-Claude-Code-Session-Id` 请求头复用会话（Claude Code 2.1.86+）
 
 当前不支持图片等结构化消息。默认启动参数包含 `--yolo`，仅建议在受信任的本机项目目录中使用。
 
