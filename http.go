@@ -13,6 +13,11 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 )
 
+const (
+	legacySessionIDHeader     = "X-Session-ID"
+	claudeCodeSessionIDHeader = "X-Claude-Code-Session-Id"
+)
+
 func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
@@ -35,7 +40,7 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid chat completion request: "+err.Error())
 		return
 	}
-	id := r.Header.Get("X-Session-ID")
+	id := requestSessionID(r)
 	session, id, err := s.session(r.Context(), id)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
@@ -83,6 +88,13 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSONOrLog(w, http.StatusOK, response)
 	slog.Info("chat completed", "sessionid", id, "elapsed", time.Since(started))
+}
+
+func requestSessionID(r *http.Request) string {
+	if id := r.Header.Get(legacySessionIDHeader); id != "" {
+		return id
+	}
+	return r.Header.Get(claudeCodeSessionIDHeader)
 }
 
 func (s *server) streamChat(
