@@ -27,9 +27,8 @@ trae-api
 | `TRAE_API_ADDR` | `127.0.0.1:8723` | 监听地址 |
 | `TRAE_API_WORKDIR` | 临时目录 | 项目目录 |
 | `TRAE_API_TOKEN` | 空 | 非本机监听时必填 |
-| `TRAE_API_DEFAULT_MODEL` | 空 | 默认模型 |
 | `TRAE_API_BIN` | `trae-cli` | CLI 可执行文件 |
-| `TRAE_API_ARGS` | `acp serve --yolo` | CLI 参数 |
+| `TRAE_API_YOLO` | `true` | 是否以 `--yolo` 启动 ACP |
 
 ## API
 
@@ -49,4 +48,4 @@ curl http://127.0.0.1:8723/v1/chat/completions \
 - 文本消息和流式响应（`"stream": true`）
 - 使用响应头 `X-Session-ID` 复用会话
 
-当前不支持图片等结构化消息。默认参数包含 `--yolo`，仅建议在受信任的本机项目目录中使用。
+当前不支持图片等结构化消息。默认启动参数包含 `--yolo`，仅建议在受信任的本机项目目录中使用。

@@ -6,18 +6,17 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strings"
+	"strconv"
 	"time"
 )
 
 type config struct {
 	Addr                string
 	TraeBin             string
-	TraeArgs            []string
+	Yolo                bool
 	Workdir             string
 	WorkdirTemp         bool
 	APIToken            string
-	DefaultModel        string
 	SessionIdleTimeout  time.Duration
 	SessionScanInterval time.Duration
 	ShutdownTimeout     time.Duration
@@ -37,6 +36,10 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	yolo, err := boolFromEnv("TRAE_API_YOLO", true)
+	if err != nil {
+		return config{}, err
+	}
 	workdir := os.Getenv("TRAE_API_WORKDIR")
 	workdirTemp := false
 	if workdir == "" {
@@ -49,11 +52,10 @@ func loadConfig() (config, error) {
 	cfg := config{
 		Addr:                getenv("TRAE_API_ADDR", "127.0.0.1:8723"),
 		TraeBin:             getenv("TRAE_API_BIN", "trae-cli"),
-		TraeArgs:            strings.Fields(getenv("TRAE_API_ARGS", "acp serve --yolo")),
+		Yolo:                yolo,
 		Workdir:             workdir,
 		WorkdirTemp:         workdirTemp,
 		APIToken:            os.Getenv("TRAE_API_TOKEN"),
-		DefaultModel:        getenv("TRAE_API_DEFAULT_MODEL", ""),
 		SessionIdleTimeout:  idleTimeout,
 		SessionScanInterval: scanInterval,
 		ShutdownTimeout:     shutdownTimeout,
@@ -65,6 +67,26 @@ func loadConfig() (config, error) {
 		return config{}, errors.New("TRAE_API_TOKEN is required when TRAE_API_ADDR is not loopback")
 	}
 	return cfg, nil
+}
+
+func boolFromEnv(key string, fallback bool) (bool, error) {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("parse %s: %w", key, err)
+	}
+	return parsed, nil
+}
+
+func acpArgs(yolo bool) []string {
+	args := []string{"acp", "serve"}
+	if yolo {
+		args = append(args, "--yolo")
+	}
+	return args
 }
 
 func isLoopbackAddr(addr string) bool {
