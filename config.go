@@ -24,7 +24,7 @@ type config struct {
 
 func loadConfig() (config, error) {
 	var err error
-	idleTimeout, err := durationFromEnv("TRAE_API_SESSION_IDLE_TIMEOUT", 15*time.Minute)
+	idleTimeout, err := durationFromEnv("TRAE_API_SESSION_IDLE_TIMEOUT", 720*time.Hour)
 	if err != nil {
 		return config{}, err
 	}

@@ -29,6 +29,8 @@ trae-api
 | `TRAE_API_TOKEN` | 空 | 非本机监听时必填 |
 | `TRAE_API_BIN` | `trae-cli` | CLI 可执行文件 |
 | `TRAE_API_YOLO` | `true` | 是否以 `--yolo` 启动 ACP |
+| `TRAE_API_SESSION_IDLE_TIMEOUT` | `720h` | session 空闲过期时间 |
+| `TRAE_API_SESSION_SCAN_INTERVAL` | `1m` | session 过期扫描间隔 |
 
 ## API
 
@@ -46,6 +48,8 @@ curl http://127.0.0.1:8723/v1/chat/completions \
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 - 文本消息和流式响应（`"stream": true`）
-- 使用响应头 `X-Session-ID` 复用会话
+- 使用响应头 `X-Session-ID` 复用会话，session ID 为随机 UUID
 
 当前不支持图片等结构化消息。默认启动参数包含 `--yolo`，仅建议在受信任的本机项目目录中使用。
+
+session 当前仅存储在内存中，默认连续空闲 30 天后过期；服务重启后需要重新建立 session。

@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"os/exec"
@@ -11,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -20,7 +20,6 @@ type server struct {
 	sessions   map[string]*traeSession
 	pending    map[string]*sessionCreation
 	newSession func(context.Context, config) (*traeSession, error)
-	nextID     uint64
 	stopScan   chan struct{}
 	scanDone   chan struct{}
 	stopOnce   sync.Once
@@ -119,8 +118,7 @@ func (s *server) handleSessionDeath(id string) {
 
 func (s *server) newSessionIDLocked() string {
 	for {
-		s.nextID++
-		id := fmt.Sprintf("sess_%d", s.nextID)
+		id := uuid.New().String()
 		if s.sessions[id] == nil && s.pending[id] == nil {
 			return id
 		}
