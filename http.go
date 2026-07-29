@@ -35,9 +35,6 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid chat completion request: "+err.Error())
 		return
 	}
-	if req.Model == "" {
-		req.Model = s.cfg.DefaultModel
-	}
 	id := r.Header.Get("X-Session-ID")
 	session, id, err := s.session(r.Context(), id)
 	if err != nil {

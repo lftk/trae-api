@@ -128,23 +128,23 @@ func (s *server) newSessionIDLocked() string {
 }
 
 func (s *server) models(w http.ResponseWriter, r *http.Request) {
-	models := []string{s.cfg.DefaultModel}
+	var models []string
 	workdir, err := resolveWorkdir(s.cfg.Workdir)
 	if err != nil {
-		slog.Warn("resolve workdir for models; using default model", "error", err)
+		slog.Warn("resolve workdir for models", "error", err)
 	} else {
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		defer cancel()
 		cmd := exec.CommandContext(ctx, s.cfg.TraeBin, "models")
 		cmd.Dir = workdir
 		if output, err := cmd.Output(); err == nil {
-			if parsed, parseErr := parseModels(output, s.cfg.DefaultModel); parseErr == nil {
+			if parsed, parseErr := parseModels(output); parseErr == nil {
 				models = parsed
 			} else {
-				slog.Warn("parse trae models; using default model", "error", parseErr)
+				slog.Warn("parse trae models", "error", parseErr)
 			}
 		} else {
-			slog.Warn("list trae models; using default model", "error", err)
+			slog.Warn("list trae models", "error", err)
 		}
 	}
 	data := make([]openai.Model, 0, len(models))
@@ -154,18 +154,16 @@ func (s *server) models(w http.ResponseWriter, r *http.Request) {
 	writeJSONOrLog(w, http.StatusOK, modelListResponse{Object: "list", Data: data})
 }
 
-func parseModels(output []byte, fallback string) ([]string, error) {
+func parseModels(output []byte) ([]string, error) {
 	var decoded []openai.Model
-	if json.Unmarshal(output, &decoded) == nil && len(decoded) > 0 {
+	if json.Unmarshal(output, &decoded) == nil {
 		models := make([]string, 0, len(decoded))
 		for _, item := range decoded {
 			if item.ID != "" {
 				models = append(models, item.ID)
 			}
 		}
-		if len(models) > 0 {
-			return models, nil
-		}
+		return models, nil
 	}
 	var models []string
 	for _, line := range strings.Split(string(output), "\n") {
@@ -174,7 +172,7 @@ func parseModels(output []byte, fallback string) ([]string, error) {
 		}
 	}
 	if len(models) == 0 {
-		return []string{fallback}, nil
+		return []string{}, nil
 	}
 	return models, nil
 }

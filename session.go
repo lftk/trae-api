@@ -24,7 +24,6 @@ type traeSession struct {
 	session      acp.SessionId
 	models       []string
 	modelID      acp.SessionConfigId
-	defaultModel string
 	currentModel string
 	lastUsed     time.Time
 	done         chan struct{}
@@ -42,7 +41,7 @@ func newSession(ctx context.Context, cfg config) (*traeSession, error) {
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.Command(cfg.TraeBin, cfg.TraeArgs...)
+	cmd := exec.Command(cfg.TraeBin, acpArgs(cfg.Yolo)...)
 	cmd.Dir = workdir
 	configureProcess(cmd)
 	stdin, err := cmd.StdinPipe()
@@ -64,7 +63,7 @@ func newSession(ctx context.Context, cfg config) (*traeSession, error) {
 	c := &traeClient{updates: make(chan update, 128)}
 	conn := acp.NewClientSideConnection(c, stdin, stdout)
 	conn.SetLogger(slog.Default())
-	s := &traeSession{cmd: cmd, stdin: stdin, conn: conn, client: c, done: make(chan struct{}), lastUsed: time.Now(), defaultModel: cfg.DefaultModel}
+	s := &traeSession{cmd: cmd, stdin: stdin, conn: conn, client: c, done: make(chan struct{}), lastUsed: time.Now()}
 	go func() {
 		if err := cmd.Wait(); err != nil {
 			slog.Error("trae cli exited with error", "error", err)
@@ -142,9 +141,6 @@ func (s *traeSession) setModel(ctx context.Context, model string) (string, error
 	if len(s.models) == 0 {
 		s.currentModel = model
 		return model, nil
-	}
-	if model == s.defaultModel && len(s.models) > 0 {
-		return s.setModel(ctx, "")
 	}
 	return "", fmt.Errorf("model %q is not advertised by trae", model)
 }
