@@ -65,11 +65,32 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Usage-Estimated", "true")
 	}
 	w.Header().Set("X-Session-ID", id)
-	writeJSONOrLog(w, http.StatusOK, openai.ChatCompletionResponse{ID: "chatcmpl-" + id, Object: "chat.completion", Created: time.Now().Unix(), Model: req.Model, Choices: []openai.ChatCompletionChoice{{Index: 0, Message: openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant, Content: answer, ReasoningContent: reasoning}, FinishReason: openai.FinishReasonStop}}, Usage: openAIUsage(usage, prompt, answer, reasoning)})
+	response := openai.ChatCompletionResponse{
+		ID:      "chatcmpl-" + id,
+		Object:  "chat.completion",
+		Created: time.Now().Unix(),
+		Model:   req.Model,
+		Choices: []openai.ChatCompletionChoice{{
+			Index: 0,
+			Message: openai.ChatCompletionMessage{
+				Role:             openai.ChatMessageRoleAssistant,
+				Content:          answer,
+				ReasoningContent: reasoning,
+			},
+			FinishReason: openai.FinishReasonStop,
+		}},
+		Usage: openAIUsage(usage, prompt, answer, reasoning),
+	}
+	writeJSONOrLog(w, http.StatusOK, response)
 	slog.Info("chat completed", "session", id, "elapsed", time.Since(started))
 }
 
-func (s *server) streamChat(w http.ResponseWriter, r *http.Request, session *traeSession, id, model, prompt string) {
+func (s *server) streamChat(
+	w http.ResponseWriter,
+	r *http.Request,
+	session *traeSession,
+	id, model, prompt string,
+) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -92,7 +113,19 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, session *tra
 		}
 		return true
 	}
-	initial := openai.ChatCompletionStreamResponse{ID: completionID, Object: "chat.completion.chunk", Created: time.Now().Unix(), Model: model, Choices: []openai.ChatCompletionStreamChoice{{Index: 0, Delta: openai.ChatCompletionStreamChoiceDelta{Role: openai.ChatMessageRoleAssistant}, FinishReason: openai.FinishReasonNull}}}
+	initial := openai.ChatCompletionStreamResponse{
+		ID:      completionID,
+		Object:  "chat.completion.chunk",
+		Created: time.Now().Unix(),
+		Model:   model,
+		Choices: []openai.ChatCompletionStreamChoice{{
+			Index: 0,
+			Delta: openai.ChatCompletionStreamChoiceDelta{
+				Role: openai.ChatMessageRoleAssistant,
+			},
+			FinishReason: openai.FinishReasonNull,
+		}},
+	}
 	if !tryWrite(initial) {
 		slog.Error("write chat completion stream", "error", streamErr)
 		return
@@ -105,7 +138,17 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, session *tra
 		if !item.Reasoning {
 			sawAnswer = sawAnswer || item.Text != ""
 		}
-		chunk := openai.ChatCompletionStreamResponse{ID: completionID, Object: "chat.completion.chunk", Created: time.Now().Unix(), Model: model, Choices: []openai.ChatCompletionStreamChoice{{Index: 0, Delta: openai.ChatCompletionStreamChoiceDelta{}, FinishReason: openai.FinishReasonNull}}}
+		chunk := openai.ChatCompletionStreamResponse{
+			ID:      completionID,
+			Object:  "chat.completion.chunk",
+			Created: time.Now().Unix(),
+			Model:   model,
+			Choices: []openai.ChatCompletionStreamChoice{{
+				Index:        0,
+				Delta:        openai.ChatCompletionStreamChoiceDelta{},
+				FinishReason: openai.FinishReasonNull,
+			}},
+		}
 		if item.Reasoning {
 			chunk.Choices[0].Delta.ReasoningContent = item.Text
 		} else {
@@ -120,7 +163,12 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, session *tra
 		return
 	}
 	if err != nil {
-		tryWrite(openai.ErrorResponse{Error: &openai.APIError{Message: err.Error(), Type: "server_error"}})
+		tryWrite(openai.ErrorResponse{
+			Error: &openai.APIError{
+				Message: err.Error(),
+				Type:    "server_error",
+			},
+		})
 	} else {
 		if usage == nil {
 			w.Header().Set("X-Usage-Estimated", "true")
@@ -129,9 +177,31 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, session *tra
 		// answer after the stream callback has already run. Send that fallback
 		// answer now so a proxy/client does not finish with an empty response.
 		if !sawAnswer && answer != "" {
-			tryWrite(openai.ChatCompletionStreamResponse{ID: completionID, Object: "chat.completion.chunk", Created: time.Now().Unix(), Model: model, Choices: []openai.ChatCompletionStreamChoice{{Index: 0, Delta: openai.ChatCompletionStreamChoiceDelta{Content: answer}, FinishReason: openai.FinishReasonNull}}})
+			tryWrite(openai.ChatCompletionStreamResponse{
+				ID:      completionID,
+				Object:  "chat.completion.chunk",
+				Created: time.Now().Unix(),
+				Model:   model,
+				Choices: []openai.ChatCompletionStreamChoice{{
+					Index: 0,
+					Delta: openai.ChatCompletionStreamChoiceDelta{
+						Content: answer,
+					},
+					FinishReason: openai.FinishReasonNull,
+				}},
+			})
 		}
-		final := openai.ChatCompletionStreamResponse{ID: completionID, Object: "chat.completion.chunk", Created: time.Now().Unix(), Model: model, Choices: []openai.ChatCompletionStreamChoice{{Index: 0, Delta: openai.ChatCompletionStreamChoiceDelta{}, FinishReason: openai.FinishReasonStop}}}
+		final := openai.ChatCompletionStreamResponse{
+			ID:      completionID,
+			Object:  "chat.completion.chunk",
+			Created: time.Now().Unix(),
+			Model:   model,
+			Choices: []openai.ChatCompletionStreamChoice{{
+				Index:        0,
+				Delta:        openai.ChatCompletionStreamChoiceDelta{},
+				FinishReason: openai.FinishReasonStop,
+			}},
+		}
 		if usage != nil {
 			final.Usage = openAIUsagePtr(usage, prompt, answer, reasoning)
 		} else {
@@ -153,9 +223,17 @@ func openAIUsage(usage *acp.Usage, prompt, answer, reasoning string) openai.Usag
 	if usage == nil {
 		promptTokens := estimateTokens(prompt)
 		completionTokens := estimateTokens(answer + reasoning)
-		return openai.Usage{PromptTokens: promptTokens, CompletionTokens: completionTokens, TotalTokens: promptTokens + completionTokens}
+		return openai.Usage{
+			PromptTokens:     promptTokens,
+			CompletionTokens: completionTokens,
+			TotalTokens:      promptTokens + completionTokens,
+		}
 	}
-	result := openai.Usage{PromptTokens: usage.InputTokens, CompletionTokens: usage.OutputTokens, TotalTokens: usage.TotalTokens}
+	result := openai.Usage{
+		PromptTokens:     usage.InputTokens,
+		CompletionTokens: usage.OutputTokens,
+		TotalTokens:      usage.TotalTokens,
+	}
 	if usage.CachedReadTokens != nil || usage.CachedWriteTokens != nil {
 		result.PromptTokensDetails = &openai.PromptTokensDetails{}
 		if usage.CachedReadTokens != nil {
@@ -163,7 +241,9 @@ func openAIUsage(usage *acp.Usage, prompt, answer, reasoning string) openai.Usag
 		}
 	}
 	if usage.ThoughtTokens != nil {
-		result.CompletionTokensDetails = &openai.CompletionTokensDetails{ReasoningTokens: *usage.ThoughtTokens}
+		result.CompletionTokensDetails = &openai.CompletionTokensDetails{
+			ReasoningTokens: *usage.ThoughtTokens,
+		}
 	}
 	return result
 }
@@ -239,7 +319,13 @@ func writeJSON(w http.ResponseWriter, status int, value any) error {
 	return nil
 }
 func writeError(w http.ResponseWriter, status int, message string) {
-	if err := writeJSON(w, status, openai.ErrorResponse{Error: &openai.APIError{Message: message, Type: "invalid_request_error"}}); err != nil {
+	response := openai.ErrorResponse{
+		Error: &openai.APIError{
+			Message: message,
+			Type:    "invalid_request_error",
+		},
+	}
+	if err := writeJSON(w, status, response); err != nil {
 		slog.Error("write error response", "error", err)
 	}
 }

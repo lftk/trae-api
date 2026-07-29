@@ -63,7 +63,14 @@ func newSession(ctx context.Context, cfg config) (*traeSession, error) {
 	c := &traeClient{updates: make(chan update, 128)}
 	conn := acp.NewClientSideConnection(c, stdin, stdout)
 	conn.SetLogger(slog.Default())
-	s := &traeSession{cmd: cmd, stdin: stdin, conn: conn, client: c, done: make(chan struct{}), lastUsed: time.Now()}
+	s := &traeSession{
+		cmd:      cmd,
+		stdin:    stdin,
+		conn:     conn,
+		client:   c,
+		done:     make(chan struct{}),
+		lastUsed: time.Now(),
+	}
 	go func() {
 		if err := cmd.Wait(); err != nil {
 			slog.Error("trae cli exited with error", "error", err)
@@ -94,7 +101,10 @@ func newSession(ctx context.Context, cfg config) (*traeSession, error) {
 		_ = s.Close()
 		return nil, fmt.Errorf("acp initialize: %w", err)
 	}
-	created, err := conn.NewSession(initCtx, acp.NewSessionRequest{Cwd: workdir, McpServers: []acp.McpServer{}})
+	created, err := conn.NewSession(initCtx, acp.NewSessionRequest{
+		Cwd:        workdir,
+		McpServers: []acp.McpServer{},
+	})
 	if err != nil {
 		_ = s.Close()
 		return nil, fmt.Errorf("acp new session: %w", err)
@@ -104,7 +114,9 @@ func newSession(ctx context.Context, cfg config) (*traeSession, error) {
 		if option.Select == nil || option.Select.Options.Ungrouped == nil {
 			continue
 		}
-		if option.Select.Category != nil && *option.Select.Category == acp.SessionConfigOptionCategoryModel {
+		isModel := option.Select.Category != nil &&
+			*option.Select.Category == acp.SessionConfigOptionCategoryModel
+		if isModel {
 			s.modelID = option.Select.Id
 			for _, model := range *option.Select.Options.Ungrouped {
 				s.models = append(s.models, string(model.Value))
@@ -130,7 +142,14 @@ func (s *traeSession) setModel(ctx context.Context, model string) (string, error
 				s.currentModel = model
 				return model, nil
 			}
-			_, err := s.conn.SetSessionConfigOption(ctx, acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{SessionId: s.session, ConfigId: s.modelID, Value: acp.SessionConfigValueId(model)}})
+			request := acp.SetSessionConfigOptionRequest{
+				ValueId: &acp.SetSessionConfigOptionValueId{
+					SessionId: s.session,
+					ConfigId:  s.modelID,
+					Value:     acp.SessionConfigValueId(model),
+				},
+			}
+			_, err := s.conn.SetSessionConfigOption(ctx, request)
 			if err != nil {
 				return "", fmt.Errorf("set session model %q: %w", model, err)
 			}
@@ -145,11 +164,19 @@ func (s *traeSession) setModel(ctx context.Context, model string) (string, error
 	return "", fmt.Errorf("model %q is not advertised by trae", model)
 }
 
-func (s *traeSession) prompt(ctx context.Context, text string, stream func(update)) (string, string, *acp.Usage, error) {
+func (s *traeSession) prompt(
+	ctx context.Context,
+	text string,
+	stream func(update),
+) (string, string, *acp.Usage, error) {
 	s.lastUsed = time.Now()
 	done := make(chan promptResult, 1)
 	go func() {
-		response, err := s.conn.Prompt(ctx, acp.PromptRequest{SessionId: s.session, Prompt: []acp.ContentBlock{acp.TextBlock(text)}})
+		request := acp.PromptRequest{
+			SessionId: s.session,
+			Prompt:    []acp.ContentBlock{acp.TextBlock(text)},
+		}
+		response, err := s.conn.Prompt(ctx, request)
 		done <- promptResult{usage: response.Usage, err: err}
 	}()
 	var answer, reasoning strings.Builder
@@ -169,7 +196,8 @@ func (s *traeSession) prompt(ctx context.Context, text string, stream func(updat
 			consume(item)
 		case result := <-done:
 			if result.err != nil {
-				return answer.String(), reasoning.String(), result.usage, fmt.Errorf("prompt trae session: %w", result.err)
+				return answer.String(), reasoning.String(), result.usage,
+					fmt.Errorf("prompt trae session: %w", result.err)
 			}
 			// SessionUpdate handlers enqueue notifications before Prompt can
 			// return, but both the final update and the completion signal may

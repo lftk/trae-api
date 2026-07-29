@@ -39,7 +39,13 @@ func main() {
 
 	serverErr := make(chan error, 1)
 	go func() {
-		slog.Info("trae-api listening", "addr", cfg.Addr, "trae", cfg.TraeBin, "args", acpArgs(cfg.Yolo), "workdir", cfg.Workdir)
+		slog.Info(
+			"trae-api listening",
+			"addr", cfg.Addr,
+			"trae", cfg.TraeBin,
+			"args", acpArgs(cfg.Yolo),
+			"workdir", cfg.Workdir,
+		)
 		serverErr <- server.ListenAndServe()
 	}()
 
