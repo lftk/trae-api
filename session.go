@@ -73,7 +73,7 @@ func newSession(ctx context.Context, cfg config) (*traeSession, error) {
 	}
 	go func() {
 		if err := cmd.Wait(); err != nil {
-			slog.Error("trae cli exited with error", "error", err)
+			slog.Error("trae cli exited with error", "sessionid", s.sessionID(), "error", err)
 		}
 		close(s.done)
 		s.mu.Lock()
@@ -109,7 +109,11 @@ func newSession(ctx context.Context, cfg config) (*traeSession, error) {
 		_ = s.Close()
 		return nil, fmt.Errorf("acp new session: %w", err)
 	}
+	s.mu.Lock()
 	s.session = created.SessionId
+	s.mu.Unlock()
+	conn.SetLogger(slog.Default().With("sessionid", string(created.SessionId)))
+	slog.Info("trae session created", "sessionid", created.SessionId)
 	for _, option := range created.ConfigOptions {
 		if option.Select == nil || option.Select.Options.Ungrouped == nil {
 			continue
@@ -124,6 +128,12 @@ func newSession(ctx context.Context, cfg config) (*traeSession, error) {
 		}
 	}
 	return s, nil
+}
+
+func (s *traeSession) sessionID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return string(s.session)
 }
 
 func (s *traeSession) setModel(ctx context.Context, model string) (string, error) {

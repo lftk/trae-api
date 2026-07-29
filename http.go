@@ -82,7 +82,7 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 		Usage: openAIUsage(usage, prompt, answer, reasoning),
 	}
 	writeJSONOrLog(w, http.StatusOK, response)
-	slog.Info("chat completed", "session", id, "elapsed", time.Since(started))
+	slog.Info("chat completed", "sessionid", id, "elapsed", time.Since(started))
 }
 
 func (s *server) streamChat(
@@ -127,7 +127,7 @@ func (s *server) streamChat(
 		}},
 	}
 	if !tryWrite(initial) {
-		slog.Error("write chat completion stream", "error", streamErr)
+		slog.Error("write chat completion stream", "sessionid", id, "error", streamErr)
 		return
 	}
 	flusher.Flush()
@@ -159,7 +159,7 @@ func (s *server) streamChat(
 		}
 	})
 	if streamErr != nil {
-		slog.Error("write chat completion stream", "error", streamErr)
+		slog.Error("write chat completion stream", "sessionid", id, "error", streamErr)
 		return
 	}
 	if err != nil {
@@ -213,7 +213,7 @@ func (s *server) streamChat(
 		}
 	}
 	if streamErr != nil {
-		slog.Error("write chat completion stream", "error", streamErr)
+		slog.Error("write chat completion stream", "sessionid", id, "error", streamErr)
 		return
 	}
 	flusher.Flush()
