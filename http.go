@@ -100,7 +100,7 @@ func requestSessionID(r *http.Request) string {
 func (s *server) streamChat(
 	w http.ResponseWriter,
 	r *http.Request,
-	session *traeSession,
+	session *session,
 	id, model, prompt string,
 ) {
 	w.Header().Set("Content-Type", "text/event-stream")
