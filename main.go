@@ -17,6 +17,7 @@ func main() {
 		slog.Error("load configuration", "error", err)
 		os.Exit(1)
 	}
+	setupLogger(cfg.Debug)
 	if cfg.WorkdirTemp {
 		defer func() {
 			if err := os.RemoveAll(cfg.Workdir); err != nil {
@@ -64,4 +65,13 @@ func main() {
 		}
 		s.shutdown()
 	}
+}
+
+func setupLogger(debug bool) {
+	level := new(slog.LevelVar)
+	level.Set(slog.LevelInfo)
+	if debug {
+		level.Set(slog.LevelDebug)
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 }

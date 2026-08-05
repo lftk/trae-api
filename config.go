@@ -14,6 +14,7 @@ type config struct {
 	Addr                string
 	TraeBin             string
 	Yolo                bool
+	Debug               bool
 	Workdir             string
 	WorkdirTemp         bool
 	APIToken            string
@@ -40,6 +41,10 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	debug, err := boolFromEnv("TRAE_API_DEBUG", false)
+	if err != nil {
+		return config{}, err
+	}
 	workdir := os.Getenv("TRAE_API_WORKDIR")
 	workdirTemp := false
 	if workdir == "" {
@@ -53,6 +58,7 @@ func loadConfig() (config, error) {
 		Addr:                getenv("TRAE_API_ADDR", "127.0.0.1:8723"),
 		TraeBin:             getenv("TRAE_API_BIN", "trae-cli"),
 		Yolo:                yolo,
+		Debug:               debug,
 		Workdir:             workdir,
 		WorkdirTemp:         workdirTemp,
 		APIToken:            os.Getenv("TRAE_API_TOKEN"),

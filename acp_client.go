@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 
 	acp "github.com/coder/acp-go-sdk"
@@ -63,9 +64,11 @@ func (c *client) SessionUpdate(ctx context.Context, n acp.SessionNotification) e
 		return fmt.Errorf("unknown ACP session %s", n.SessionId)
 	}
 	if n.Update.AgentMessageChunk != nil && n.Update.AgentMessageChunk.Content.Text != nil {
+		slog.Debug("ACP agent message chunk", "acp_sessionid", n.SessionId, "text", n.Update.AgentMessageChunk.Content.Text.Text)
 		return c.sendUpdate(ctx, s.updates, update{Text: n.Update.AgentMessageChunk.Content.Text.Text})
 	}
 	if n.Update.AgentThoughtChunk != nil && n.Update.AgentThoughtChunk.Content.Text != nil {
+		slog.Debug("ACP agent thought chunk", "acp_sessionid", n.SessionId, "text", n.Update.AgentThoughtChunk.Content.Text.Text)
 		return c.sendUpdate(ctx, s.updates, update{Text: n.Update.AgentThoughtChunk.Content.Text.Text, Reasoning: true})
 	}
 	return nil
