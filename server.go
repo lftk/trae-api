@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -38,6 +37,13 @@ type sessionCreation struct {
 	session *session
 	err     error
 }
+
+type sessionLease struct {
+	session *session
+	id      string
+	release func()
+}
+
 type modelListResponse struct {
 	Object string         `json:"object"`
 	Data   []openai.Model `json:"data"`
@@ -60,31 +66,51 @@ func newServer(cfg config) *server {
 	return s
 }
 
-func (s *server) session(ctx context.Context, id string) (*session, string, error) {
-	s.mu.Lock()
-	if id != "" {
-		if session := s.sessions[id]; session != nil {
-			select {
-			case <-session.process.done:
-				delete(s.sessions, id)
-			default:
-				session.mu.Lock()
-				session.touchLocked()
-				session.mu.Unlock()
-				s.mu.Unlock()
-				return session, id, nil
-			}
+func (s *server) acquireSession(ctx context.Context, id string) (*sessionLease, error) {
+	if id == "" {
+		process, err := s.ensureProcess(ctx)
+		if err != nil {
+			return nil, err
 		}
-	} else {
-		id = s.newSessionIDLocked()
+		session, err := process.newSession(ctx)
+		if err != nil {
+			return nil, err
+		}
+		var once sync.Once
+		return &sessionLease{
+			session: session,
+			release: func() {
+				once.Do(func() {
+					if err := session.Close(); err != nil {
+						slog.Warn("close temporary ACP session", "sessionid", session.sessionID(), "error", err)
+					}
+				})
+			},
+		}, nil
+	}
+	s.mu.Lock()
+	if session := s.sessions[id]; session != nil {
+		select {
+		case <-session.process.done:
+			delete(s.sessions, id)
+		default:
+			session.mu.Lock()
+			session.touchLocked()
+			session.mu.Unlock()
+			s.mu.Unlock()
+			return &sessionLease{session: session, id: id, release: func() {}}, nil
+		}
 	}
 	if creation := s.pending[id]; creation != nil {
 		s.mu.Unlock()
 		select {
 		case <-creation.done:
-			return creation.session, id, creation.err
+			if creation.err != nil {
+				return nil, creation.err
+			}
+			return &sessionLease{session: creation.session, id: id, release: func() {}}, nil
 		case <-ctx.Done():
-			return nil, "", ctx.Err()
+			return nil, ctx.Err()
 		}
 	}
 	creation := &sessionCreation{done: make(chan struct{})}
@@ -104,12 +130,12 @@ func (s *server) session(ctx context.Context, id string) (*session, string, erro
 	if err != nil {
 		close(creation.done)
 		s.mu.Unlock()
-		return nil, "", err
+		return nil, err
 	}
 	s.sessions[id] = session
 	close(creation.done)
 	s.mu.Unlock()
-	return session, id, nil
+	return &sessionLease{session: session, id: id, release: func() {}}, nil
 }
 
 func (s *server) ensureProcess(ctx context.Context) (*process, error) {
@@ -163,15 +189,6 @@ func (s *server) handleProcessDeath(process *process) {
 		slog.Error("shared trae ACP process failed; sessions invalidated")
 	}
 	s.mu.Unlock()
-}
-
-func (s *server) newSessionIDLocked() string {
-	for {
-		id := uuid.New().String()
-		if s.sessions[id] == nil && s.pending[id] == nil {
-			return id
-		}
-	}
 }
 
 func (s *server) models(w http.ResponseWriter, r *http.Request) {

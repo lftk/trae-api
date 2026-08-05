@@ -6,10 +6,12 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 	"unicode"
 
 	acp "github.com/coder/acp-go-sdk"
+	"github.com/google/uuid"
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -40,12 +42,14 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid chat completion request: "+err.Error())
 		return
 	}
-	id := requestSessionID(r)
-	session, id, err := s.session(r.Context(), id)
+	externalID := requestSessionID(r)
+	lease, err := s.acquireSession(r.Context(), externalID)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	defer lease.release()
+	session := lease.session
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	selectedModel, err := session.setModel(r.Context(), req.Model)
@@ -57,8 +61,10 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 		req.Model = selectedModel
 	}
 	prompt := formatPrompt(req.Messages)
+	completionID := "chatcmpl-" + uuid.NewString()
+	slog.Debug("chat request", "method", r.Method, "path", r.URL.Path, "headers", debugHeaders(r.Header), "external_sessionid", externalID, "acp_sessionid", session.sessionID(), "completionid", completionID, "model", req.Model, "stream", req.Stream, "prompt", prompt)
 	if req.Stream {
-		s.streamChat(w, r, session, id, req.Model, prompt)
+		s.streamChat(w, r, session, completionID, externalID, req.Model, prompt)
 		return
 	}
 	answer, reasoning, usage, err := session.prompt(r.Context(), prompt, nil)
@@ -69,9 +75,11 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 	if usage == nil {
 		w.Header().Set("X-Usage-Estimated", "true")
 	}
-	w.Header().Set("X-Session-ID", id)
+	if externalID != "" {
+		w.Header().Set("X-Session-ID", externalID)
+	}
 	response := openai.ChatCompletionResponse{
-		ID:      "chatcmpl-" + id,
+		ID:      completionID,
 		Object:  "chat.completion",
 		Created: time.Now().Unix(),
 		Model:   req.Model,
@@ -87,7 +95,8 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 		Usage: openAIUsage(usage, prompt, answer, reasoning),
 	}
 	writeJSONOrLog(w, http.StatusOK, response)
-	slog.Info("chat completed", "sessionid", id, "elapsed", time.Since(started))
+	slog.Debug("chat response", "completionid", completionID, "external_sessionid", externalID, "acp_sessionid", session.sessionID(), "answer", answer, "reasoning", reasoning, "usage", response.Usage)
+	slog.Info("chat completed", "completionid", completionID, "sessionid", externalID, "acpsessionid", session.sessionID(), "elapsed", time.Since(started))
 }
 
 func requestSessionID(r *http.Request) string {
@@ -101,18 +110,19 @@ func (s *server) streamChat(
 	w http.ResponseWriter,
 	r *http.Request,
 	session *session,
-	id, model, prompt string,
+	completionID, externalID, model, prompt string,
 ) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Session-ID", id)
+	if externalID != "" {
+		w.Header().Set("X-Session-ID", externalID)
+	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "streaming is not supported")
 		return
 	}
-	completionID := "chatcmpl-" + id
 	var streamErr error
 	var sawAnswer bool
 	tryWrite := func(value any) bool {
@@ -139,7 +149,7 @@ func (s *server) streamChat(
 		}},
 	}
 	if !tryWrite(initial) {
-		slog.Error("write chat completion stream", "sessionid", id, "error", streamErr)
+		slog.Error("write chat completion stream", "completionid", completionID, "sessionid", externalID, "acpsessionid", session.sessionID(), "error", streamErr)
 		return
 	}
 	flusher.Flush()
@@ -170,8 +180,9 @@ func (s *server) streamChat(
 			flusher.Flush()
 		}
 	})
+	slog.Debug("stream response", "completionid", completionID, "external_sessionid", externalID, "acp_sessionid", session.sessionID(), "answer", answer, "reasoning", reasoning, "usage", usage, "error", err)
 	if streamErr != nil {
-		slog.Error("write chat completion stream", "sessionid", id, "error", streamErr)
+		slog.Error("write chat completion stream", "completionid", completionID, "sessionid", externalID, "acpsessionid", session.sessionID(), "error", streamErr)
 		return
 	}
 	if err != nil {
@@ -225,10 +236,25 @@ func (s *server) streamChat(
 		}
 	}
 	if streamErr != nil {
-		slog.Error("write chat completion stream", "sessionid", id, "error", streamErr)
+		slog.Error("write chat completion stream", "completionid", completionID, "sessionid", externalID, "acpsessionid", session.sessionID(), "error", streamErr)
 		return
 	}
 	flusher.Flush()
+}
+
+func debugHeaders(headers http.Header) map[string][]string {
+	result := make(map[string][]string, len(headers))
+	for name, values := range headers {
+		if strings.EqualFold(name, "Authorization") ||
+			strings.EqualFold(name, "Cookie") ||
+			strings.EqualFold(name, "Set-Cookie") ||
+			strings.EqualFold(name, "X-API-Key") {
+			result[name] = []string{"<redacted>"}
+			continue
+		}
+		result[name] = append([]string(nil), values...)
+	}
+	return result
 }
 
 func openAIUsage(usage *acp.Usage, prompt, answer, reasoning string) openai.Usage {

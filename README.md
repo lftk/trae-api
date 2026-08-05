@@ -29,6 +29,7 @@ trae-api
 | `TRAE_API_TOKEN` | 空 | 非本机监听时必填 |
 | `TRAE_API_BIN` | `trae-cli` | CLI 可执行文件 |
 | `TRAE_API_YOLO` | `true` | 是否以 `--yolo` 启动 ACP |
+| `TRAE_API_DEBUG` | `false` | 是否输出请求、响应和 ACP 调试日志 |
 | `TRAE_API_SESSION_IDLE_TIMEOUT` | `720h` | session 空闲过期时间 |
 | `TRAE_API_SESSION_SCAN_INTERVAL` | `1m` | session 过期扫描间隔 |
 
@@ -48,7 +49,7 @@ curl http://127.0.0.1:8723/v1/chat/completions \
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 - 文本消息和流式响应（`"stream": true`）
-- 使用请求头 `X-Session-ID` 复用会话，session ID 为随机 UUID
+- 使用请求头 `X-Session-ID` 复用会话；匿名请求不会自动返回可复用的 session ID
 - Claude Code 可直接使用其 `X-Claude-Code-Session-Id` 请求头复用会话（Claude Code 2.1.86+）
 
 当前不支持图片等结构化消息。默认启动参数包含 `--yolo`，仅建议在受信任的本机项目目录中使用。
@@ -56,10 +57,17 @@ curl http://127.0.0.1:8723/v1/chat/completions \
 服务进程内会懒启动一个共享的 `trae-cli acp serve` 进程；每个逻辑 session
 在该连接上拥有独立的 ACP `SessionId`。因此进程生命周期与 ACP session 生命周期
 是分离的：稳定的 `X-Session-ID` 或 `X-Claude-Code-Session-Id` 会复用对应 ACP
-session，而没有稳定标识的请求每次创建新的 ACP session，但不会创建新的 trae-cli
-进程。服务只使用当前配置的一个工作目录。
+session，而没有稳定标识的请求每次创建请求级临时 ACP session，但不会创建新的
+trae-cli 进程。服务只使用当前配置的一个工作目录。
 
-session 当前仅存储在内存中，默认连续空闲 30 天后过期。若 ACP 声明支持
-`session/close`，过期 session 会向 ACP 发送关闭请求；否则至少删除本地映射并记录
-警告。共享进程崩溃会使该进程上的所有 session 一起失效，下一次请求会重新懒启动
-进程；正在进行的请求会收到 upstream/ACP 错误。服务重启后需要重新建立 session。
+显式 session 当前仅存储在内存中，默认连续空闲 30 天后过期。若 ACP 声明支持
+`session/close`，过期 session 会向 ACP 发送关闭请求。匿名请求使用完整的
+`messages`，prompt 完成后立即从 client 的 ACP session 路由表中释放临时 session。
+共享进程崩溃会使该进程上的所有 session 一起失效，下一次请求
+会重新懒启动进程；正在进行的请求会收到 upstream/ACP 错误。服务重启后需要重新
+建立 session。
+
+无 session ID 的请求应在每次请求中携带完整消息历史。显式 session ID 的首次请求
+可以携带初始上下文，后续请求只需携带新增消息，历史由 ACP session 保存。服务端
+不会保存或比较 transcript。若 ACP 不支持 `session/close`，临时 session 的本地
+引用仍会立即释放，但上游资源只能随共享 trae-cli 进程退出而释放。

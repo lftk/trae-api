@@ -38,18 +38,20 @@ func TestServerReusesProcessAndStableSessions(t *testing.T) {
 	s := newServer(config{})
 	s.newProcess = factory
 
-	one, oneID, err := s.session(context.Background(), "client-1")
+	oneLease, err := s.acquireSession(context.Background(), "client-1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	oneAgain, _, err := s.session(context.Background(), oneID)
+	one := oneLease.session
+	oneAgainLease, err := s.acquireSession(context.Background(), oneLease.id)
 	if err != nil {
 		t.Fatal(err)
 	}
+	oneAgain := oneAgainLease.session
 	if one != oneAgain || one.sessionID() != "acp-1" {
 		t.Fatalf("stable session was not reused: %p/%p %s", one, oneAgain, one.sessionID())
 	}
-	if _, _, err := s.session(context.Background(), "client-2"); err != nil {
+	if _, err := s.acquireSession(context.Background(), "client-2"); err != nil {
 		t.Fatal(err)
 	}
 	if got, created := current(); got == nil || got.client == nil {
@@ -64,13 +66,24 @@ func TestServerCreatesFreshACPSessionWithoutExternalID(t *testing.T) {
 	s := newServer(config{})
 	s.newProcess = factory
 
-	one, _, err := s.session(context.Background(), "")
+	oneLease, err := s.acquireSession(context.Background(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	two, _, err := s.session(context.Background(), "")
+	one := oneLease.session
+	p, _ := current()
+	if len(s.sessions) != 0 || len(s.pending) != 0 || len(p.client.sessions) != 1 {
+		t.Fatalf("anonymous session was retained: sessions=%d pending=%d", len(s.sessions), len(s.pending))
+	}
+	twoLease, err := s.acquireSession(context.Background(), "")
 	if err != nil {
 		t.Fatal(err)
+	}
+	two := twoLease.session
+	oneLease.release()
+	twoLease.release()
+	if len(p.client.sessions) != 0 {
+		t.Fatalf("temporary ACP sessions remained: %d", len(p.client.sessions))
 	}
 	if one.sessionID() == two.sessionID() {
 		t.Fatalf("anonymous requests reused ACP session %q", one.sessionID())
@@ -82,11 +95,35 @@ func TestServerCreatesFreshACPSessionWithoutExternalID(t *testing.T) {
 	}
 }
 
+func TestTemporarySessionReleaseClosesSupportedACPSession(t *testing.T) {
+	factory, current := testProcessFactory()
+	s := newServer(config{})
+	s.newProcess = factory
+	lease, err := s.acquireSession(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, _ := current()
+	p.closeSupported = true
+	var closed acp.SessionId
+	p.closeSessionFunc = func(context.Context, acp.SessionId) error {
+		closed = lease.session.session
+		return nil
+	}
+	lease.release()
+	if closed != lease.session.session {
+		t.Fatalf("closed ACP session %q, want %q", closed, lease.session.session)
+	}
+	if len(s.sessions) != 0 || len(s.pending) != 0 {
+		t.Fatalf("temporary session was retained: sessions=%d pending=%d", len(s.sessions), len(s.pending))
+	}
+}
+
 func TestServerRecreatesProcessAfterFailure(t *testing.T) {
 	factory, current := testProcessFactory()
 	s := newServer(config{})
 	s.newProcess = factory
-	if _, _, err := s.session(context.Background(), "client"); err != nil {
+	if _, err := s.acquireSession(context.Background(), "client"); err != nil {
 		t.Fatal(err)
 	}
 	p, created := current()
@@ -94,7 +131,7 @@ func TestServerRecreatesProcessAfterFailure(t *testing.T) {
 		t.Fatalf("created %d processes, want 1", created)
 	}
 	s.handleProcessDeath(p)
-	if _, _, err := s.session(context.Background(), "client"); err != nil {
+	if _, err := s.acquireSession(context.Background(), "client"); err != nil {
 		t.Fatal(err)
 	}
 	if _, created = current(); created != 2 {
@@ -106,10 +143,11 @@ func TestReapIdleSessionClosesSupportedACPSession(t *testing.T) {
 	factory, current := testProcessFactory()
 	s := newServer(config{SessionIdleTimeout: time.Minute})
 	s.newProcess = factory
-	session, id, err := s.session(context.Background(), "idle-client")
+	lease, err := s.acquireSession(context.Background(), "idle-client")
 	if err != nil {
 		t.Fatal(err)
 	}
+	session, id := lease.session, lease.id
 	p, _ := current()
 	p.closeSupported = true
 	var closed acp.SessionId

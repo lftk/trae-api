@@ -18,18 +18,18 @@ import (
 // process is the lifetime of one trae-cli ACP connection. It can own
 // many independent ACP sessions.
 type process struct {
-	mu               sync.Mutex
-	cmd              *exec.Cmd
-	stdin            io.WriteCloser
-	conn             *acp.ClientSideConnection
-	client           *client
-	workdir          string
-	closeSupported   bool
-	done             chan struct{}
-	onDone           func()
-	closeOnce        sync.Once
-	newSessionFunc   func(context.Context) (*session, error)
-	closeSessionFunc func(context.Context, acp.SessionId) error
+	mu                sync.Mutex
+	cmd               *exec.Cmd
+	stdin             io.WriteCloser
+	conn              *acp.ClientSideConnection
+	client            *client
+	workdir           string
+	closeSupported    bool
+	done              chan struct{}
+	onDone            func()
+	closeOnce         sync.Once
+	newSessionFunc    func(context.Context) (*session, error)
+	closeSessionFunc  func(context.Context, acp.SessionId) error
 }
 
 // session is deliberately only session-scoped state. The HTTP session ID
