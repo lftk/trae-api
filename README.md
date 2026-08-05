@@ -33,6 +33,11 @@ trae-api
 | `TRAE_API_SESSION_IDLE_TIMEOUT` | `720h` | session 空闲过期时间 |
 | `TRAE_API_SESSION_SCAN_INTERVAL` | `1m` | session 过期扫描间隔 |
 
+未设置 `TRAE_API_WORKDIR` 时，服务创建的临时目录仅是 ACP 所需的隔离占位工作区，
+并不代表调用方的真实项目。每个 ACP session 的首次 prompt 会自动加入工作区声明，
+要求代理不要从该目录推断项目结构或操作其中的文件，而只使用对话中提供的上下文。
+如果任务需要访问真实项目文件，仍须在启动服务时显式设置 `TRAE_API_WORKDIR`。
+
 ## API
 
 ```bash

@@ -67,7 +67,7 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 		s.streamChat(w, r, session, completionID, externalID, req.Model, prompt)
 		return
 	}
-	answer, reasoning, usage, err := session.prompt(r.Context(), prompt, nil)
+	answer, reasoning, usage, sentPrompt, err := session.prompt(r.Context(), prompt, nil)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -92,7 +92,7 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 			},
 			FinishReason: openai.FinishReasonStop,
 		}},
-		Usage: openAIUsage(usage, prompt, answer, reasoning),
+		Usage: openAIUsage(usage, sentPrompt, answer, reasoning),
 	}
 	writeJSONOrLog(w, http.StatusOK, response)
 	slog.Debug("chat response", "completionid", completionID, "external_sessionid", externalID, "acp_sessionid", session.sessionID(), "answer", answer, "reasoning", reasoning, "usage", response.Usage)
@@ -153,7 +153,7 @@ func (s *server) streamChat(
 		return
 	}
 	flusher.Flush()
-	answer, reasoning, usage, err := session.prompt(r.Context(), prompt, func(item update) {
+	answer, reasoning, usage, sentPrompt, err := session.prompt(r.Context(), prompt, func(item update) {
 		if streamErr != nil {
 			return
 		}
@@ -226,9 +226,9 @@ func (s *server) streamChat(
 			}},
 		}
 		if usage != nil {
-			final.Usage = openAIUsagePtr(usage, prompt, answer, reasoning)
+			final.Usage = openAIUsagePtr(usage, sentPrompt, answer, reasoning)
 		} else {
-			estimated := openAIUsage(usage, prompt, answer, reasoning)
+			estimated := openAIUsage(usage, sentPrompt, answer, reasoning)
 			final.Usage = &estimated
 		}
 		if tryWrite(final) {

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -14,11 +15,11 @@ func testProcessFactory() (func(context.Context, config) (*process, error), func
 	var mu sync.Mutex
 	created := 0
 	var currentProcess *process
-	factory := func(context.Context, config) (*process, error) {
+	factory := func(_ context.Context, cfg config) (*process, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		created++
-		p := &process{done: make(chan struct{}), client: &client{sessions: make(map[acp.SessionId]*session)}}
+		p := &process{done: make(chan struct{}), client: &client{sessions: make(map[acp.SessionId]*session)}, workdirTemp: cfg.WorkdirTemp}
 		var sequence int
 		p.newSessionFunc = func(context.Context) (*session, error) {
 			sequence++
@@ -63,7 +64,7 @@ func TestServerReusesProcessAndStableSessions(t *testing.T) {
 
 func TestServerCreatesFreshACPSessionWithoutExternalID(t *testing.T) {
 	factory, current := testProcessFactory()
-	s := newServer(config{})
+	s := newServer(config{WorkdirTemp: true})
 	s.newProcess = factory
 
 	oneLease, err := s.acquireSession(context.Background(), "")
@@ -80,6 +81,11 @@ func TestServerCreatesFreshACPSessionWithoutExternalID(t *testing.T) {
 		t.Fatal(err)
 	}
 	two := twoLease.session
+	for _, temporary := range []*session{one, two} {
+		if got := temporary.preparePrompt("[user]\nHello"); !strings.HasPrefix(got, "[system]\n"+temporaryWorkspaceNotice) {
+			t.Fatalf("anonymous session %q did not receive workspace notice: %q", temporary.sessionID(), got)
+		}
+	}
 	oneLease.release()
 	twoLease.release()
 	if len(p.client.sessions) != 0 {

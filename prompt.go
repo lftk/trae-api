@@ -7,6 +7,12 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 )
 
+const temporaryWorkspaceNotice = `Important workspace notice:
+
+The current ACP working directory is an isolated temporary placeholder created by trae-api. It is not the user's actual project directory and must not be used to infer the project's structure, files, repository state, or instructions.
+
+Use only the project context and file contents supplied in the conversation. Do not create, edit, search, or execute project files in this temporary directory unless the user explicitly asks you to do so. If the task requires access to files that were not supplied, state that the actual project workspace is unavailable.`
+
 func validateMessages(messages []openai.ChatCompletionMessage) error {
 	for _, message := range messages {
 		for _, part := range message.MultiContent {
@@ -26,6 +32,14 @@ func formatPrompt(messages []openai.ChatCompletionMessage) string {
 		b.WriteString("\n\n")
 	}
 	return strings.TrimSpace(b.String())
+}
+
+func (s *session) preparePrompt(text string) string {
+	if s.process == nil || !s.process.workdirTemp || s.workspaceNoticeSent {
+		return text
+	}
+	s.workspaceNoticeSent = true
+	return "[system]\n" + temporaryWorkspaceNotice + "\n\n" + text
 }
 
 func messageText(message openai.ChatCompletionMessage) string {

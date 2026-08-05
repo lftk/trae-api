@@ -18,31 +18,33 @@ import (
 // process is the lifetime of one trae-cli ACP connection. It can own
 // many independent ACP sessions.
 type process struct {
-	mu                sync.Mutex
-	cmd               *exec.Cmd
-	stdin             io.WriteCloser
-	conn              *acp.ClientSideConnection
-	client            *client
-	workdir           string
-	closeSupported    bool
-	done              chan struct{}
-	onDone            func()
-	closeOnce         sync.Once
-	newSessionFunc    func(context.Context) (*session, error)
-	closeSessionFunc  func(context.Context, acp.SessionId) error
+	mu               sync.Mutex
+	cmd              *exec.Cmd
+	stdin            io.WriteCloser
+	conn             *acp.ClientSideConnection
+	client           *client
+	workdir          string
+	workdirTemp      bool
+	closeSupported   bool
+	done             chan struct{}
+	onDone           func()
+	closeOnce        sync.Once
+	newSessionFunc   func(context.Context) (*session, error)
+	closeSessionFunc func(context.Context, acp.SessionId) error
 }
 
 // session is deliberately only session-scoped state. The HTTP session ID
 // is mapped to this object by server; ACP notifications use session instead.
 type session struct {
-	mu           sync.Mutex
-	process      *process
-	session      acp.SessionId
-	models       []string
-	modelID      acp.SessionConfigId
-	currentModel string
-	lastUsed     time.Time
-	updates      chan update
+	mu                  sync.Mutex
+	process             *process
+	session             acp.SessionId
+	models              []string
+	modelID             acp.SessionConfigId
+	currentModel        string
+	workspaceNoticeSent bool
+	lastUsed            time.Time
+	updates             chan update
 }
 
 type promptResult struct {
@@ -75,7 +77,7 @@ func startProcess(ctx context.Context, cfg config) (*process, error) {
 		return nil, fmt.Errorf("start trae cli: %w", err)
 	}
 	p := &process{
-		cmd: cmd, stdin: stdin, workdir: workdir,
+		cmd: cmd, stdin: stdin, workdir: workdir, workdirTemp: cfg.WorkdirTemp,
 		client: &client{sessions: make(map[acp.SessionId]*session)},
 		done:   make(chan struct{}),
 	}
@@ -205,8 +207,9 @@ func (s *session) setModel(ctx context.Context, model string) (string, error) {
 	return "", fmt.Errorf("model %q is not advertised by trae", model)
 }
 
-func (s *session) prompt(ctx context.Context, text string, stream func(update)) (string, string, *acp.Usage, error) {
+func (s *session) prompt(ctx context.Context, text string, stream func(update)) (string, string, *acp.Usage, string, error) {
 	s.lastUsed = time.Now()
+	text = s.preparePrompt(text)
 	done := make(chan promptResult, 1)
 	go func() {
 		response, err := s.process.conn.Prompt(ctx, acp.PromptRequest{SessionId: s.session, Prompt: []acp.ContentBlock{acp.TextBlock(text)}})
@@ -229,7 +232,7 @@ func (s *session) prompt(ctx context.Context, text string, stream func(update)) 
 			consume(item)
 		case result := <-done:
 			if result.err != nil {
-				return answer.String(), reasoning.String(), result.usage, fmt.Errorf("prompt trae session: %w", result.err)
+				return answer.String(), reasoning.String(), result.usage, text, fmt.Errorf("prompt trae session: %w", result.err)
 			}
 			for {
 				select {
@@ -237,14 +240,14 @@ func (s *session) prompt(ctx context.Context, text string, stream func(update)) 
 					consume(item)
 				case <-ctx.Done():
 					a, r := responseText(answer.String(), reasoning.String())
-					return a, r, result.usage, ctx.Err()
+					return a, r, result.usage, text, ctx.Err()
 				default:
 					a, r := responseText(answer.String(), reasoning.String())
-					return a, r, result.usage, nil
+					return a, r, result.usage, text, nil
 				}
 			}
 		case <-ctx.Done():
-			return answer.String(), reasoning.String(), nil, ctx.Err()
+			return answer.String(), reasoning.String(), nil, text, ctx.Err()
 		}
 	}
 }
