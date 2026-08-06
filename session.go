@@ -30,6 +30,7 @@ type process struct {
 	doneOnce         sync.Once
 	stopOnce         sync.Once
 	stopErr          error
+	stopRequested    bool
 	stopped          chan struct{}
 	boundSession     acp.SessionId
 	sessionCreating  bool
@@ -110,8 +111,14 @@ func startProcess(ctx context.Context, cfg config) (*process, error) {
 }
 
 func (p *process) wait() {
-	if err := p.cmd.Wait(); err != nil {
+	err := p.cmd.Wait()
+	p.mu.Lock()
+	stopRequested := p.stopRequested
+	p.mu.Unlock()
+	if err != nil && !stopRequested {
 		slog.Error("trae cli exited with error", "error", err)
+	} else if err != nil {
+		slog.Debug("trae cli stopped", "error", err)
 	}
 	p.notifyDone()
 }
@@ -347,6 +354,9 @@ func (p *process) closeSession(ctx context.Context, id acp.SessionId) error {
 
 func (p *process) Close() error {
 	p.stopOnce.Do(func() {
+		p.mu.Lock()
+		p.stopRequested = true
+		p.mu.Unlock()
 		if p.stdin != nil {
 			p.stopErr = errors.Join(p.stopErr, p.stdin.Close())
 		}
