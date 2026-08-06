@@ -32,6 +32,9 @@ trae-api
 | `TRAE_API_DEBUG` | `false` | 是否输出请求、响应和 ACP 调试日志 |
 | `TRAE_API_SESSION_IDLE_TIMEOUT` | `720h` | session 空闲过期时间 |
 | `TRAE_API_SESSION_SCAN_INTERVAL` | `1m` | session 过期扫描间隔 |
+| `TRAE_API_WARM_PROCESSES` | `1` | 后台预热的空闲 ACP 进程数，设为 `0` 禁用 |
+| `TRAE_API_MAX_SESSIONS` | `100` | 稳定 session 数量上限 |
+| `TRAE_API_MAX_PROCESSES` | `100` | trae-cli ACP 进程总数上限 |
 
 未设置 `TRAE_API_WORKDIR` 时，服务创建的临时目录仅是 ACP 所需的隔离占位工作区，
 并不代表调用方的真实项目。每个 ACP session 的首次 prompt 会自动加入工作区声明，
@@ -59,20 +62,24 @@ curl http://127.0.0.1:8723/v1/chat/completions \
 
 当前不支持图片等结构化消息。默认启动参数包含 `--yolo`，仅建议在受信任的本机项目目录中使用。
 
-服务进程内会懒启动一个共享的 `trae-cli acp serve` 进程；每个逻辑 session
-在该连接上拥有独立的 ACP `SessionId`。因此进程生命周期与 ACP session 生命周期
-是分离的：稳定的 `X-Session-ID` 或 `X-Claude-Code-Session-Id` 会复用对应 ACP
-session，而没有稳定标识的请求每次创建请求级临时 ACP session，但不会创建新的
-trae-cli 进程。服务只使用当前配置的一个工作目录。
+每个逻辑 session 都独占一个 `trae-cli acp serve` 进程。服务启动后会在后台预热
+`TRAE_API_WARM_PROCESSES` 个已完成 ACP 初始化的空闲进程；稳定 session 优先领取
+预热进程，领取后后台补充池容量。池为空时才会按需冷启动，因此首次请求通常无需等待
+进程启动。稳定的
+`X-Session-ID` 或 `X-Claude-Code-Session-Id` 会复用对应的 ACP session 和进程，
+不同 session 可以并发执行 prompt。首次请求需要承担进程启动和 ACP 初始化耗时；
+后续请求不会重复启动进程。没有稳定标识的请求每次创建请求级临时 ACP session 和
+进程，prompt 完成或请求结束后会销毁该 session 及进程。服务只使用当前配置的一个
+工作目录。
 
 显式 session 当前仅存储在内存中，默认连续空闲 30 天后过期。若 ACP 声明支持
 `session/close`，过期 session 会向 ACP 发送关闭请求。匿名请求使用完整的
 `messages`，prompt 完成后立即从 client 的 ACP session 路由表中释放临时 session。
-共享进程崩溃会使该进程上的所有 session 一起失效，下一次请求
-会重新懒启动进程；正在进行的请求会收到 upstream/ACP 错误。服务重启后需要重新
-建立 session。
+某个 session 的 ACP 进程崩溃只会使该 session 失效，下一次请求会重新懒启动该
+session 的进程；正在进行的请求会收到 upstream/ACP 错误。服务重启后需要重新建立
+session。
 
 无 session ID 的请求应在每次请求中携带完整消息历史。显式 session ID 的首次请求
 可以携带初始上下文，后续请求只需携带新增消息，历史由 ACP session 保存。服务端
 不会保存或比较 transcript。若 ACP 不支持 `session/close`，临时 session 的本地
-引用仍会立即释放，但上游资源只能随共享 trae-cli 进程退出而释放。
+引用和对应的 trae-cli 进程都会在请求结束时释放。
