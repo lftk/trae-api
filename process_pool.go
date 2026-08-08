@@ -7,7 +7,6 @@ import (
 	"sync"
 )
 
-var errProcessLimit = errors.New("maximum trae ACP process limit reached")
 var errSessionLimit = errors.New("maximum trae ACP session limit reached")
 
 // processPool owns initialized, not-yet-bound ACP processes. A process is
@@ -46,13 +45,11 @@ func (p *processPool) acquire(ctx context.Context) (*process, error) {
 		if len(p.idle) > 0 {
 			process := p.idle[len(p.idle)-1]
 			p.idle = p.idle[:len(p.idle)-1]
-			notify := p.notify
 			p.mu.Unlock()
 			p.fill()
 			select {
 			case <-process.done:
 				_ = process.Close()
-				_ = notify
 				continue
 			default:
 			}
@@ -62,14 +59,10 @@ func (p *processPool) acquire(ctx context.Context) (*process, error) {
 			p.mu.Unlock()
 			return nil, errors.New("process pool is shutting down")
 		}
-		if p.pending == 0 && (p.cfg.MaxProcesses <= 0 || p.total < p.cfg.MaxProcesses) {
+		if p.pending == 0 {
 			p.pending++
 			p.mu.Unlock()
 			return p.create(ctx)
-		}
-		if p.pending == 0 && p.cfg.MaxProcesses > 0 && p.total >= p.cfg.MaxProcesses {
-			p.mu.Unlock()
-			return nil, errProcessLimit
 		}
 		notify := p.notify
 		p.mu.Unlock()
@@ -107,7 +100,6 @@ func (p *processPool) create(ctx context.Context) (*process, error) {
 func (p *processPool) fill() {
 	p.mu.Lock()
 	for len(p.idle)+p.pending < p.cfg.WarmProcesses &&
-		(p.cfg.MaxProcesses <= 0 || p.total+p.pending < p.cfg.MaxProcesses) &&
 		!p.stopping {
 		p.pending++
 		p.wg.Add(1)

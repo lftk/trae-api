@@ -19,7 +19,7 @@ func testProcessFactory() (func(context.Context, config) (*process, error), func
 		mu.Lock()
 		defer mu.Unlock()
 		created++
-		p := &process{done: make(chan struct{}), stopped: make(chan struct{}), client: &client{sessions: make(map[acp.SessionId]*session)}, workdirTemp: cfg.WorkdirTemp}
+		p := &process{done: make(chan struct{}), client: &client{sessions: make(map[acp.SessionId]*session)}, workdirTemp: cfg.WorkdirTemp}
 		var sequence int
 		p.newSessionFunc = func(context.Context) (*session, error) {
 			sequence++
@@ -96,12 +96,12 @@ func TestServerCreatesFreshACPSessionWithoutExternalID(t *testing.T) {
 		t.Fatalf("temporary ACP sessions remained: %d", len(p.client.sessions))
 	}
 	select {
-	case <-one.process.stopped:
+	case <-one.process.done:
 	default:
 		t.Fatal("first temporary session process was not closed")
 	}
 	select {
-	case <-two.process.stopped:
+	case <-two.process.done:
 	default:
 		t.Fatal("second temporary session process was not closed")
 	}
@@ -208,7 +208,7 @@ func TestTraeClientRoutesUpdatesByACPSessionID(t *testing.T) {
 
 func TestProcessPoolUsesWarmProcessAndClosesIt(t *testing.T) {
 	factory, _ := testProcessFactory()
-	p := newProcessPool(config{WarmProcesses: 1, MaxProcesses: 2}, factory)
+	p := newProcessPool(config{WarmProcesses: 1}, factory)
 	process, err := p.acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -219,22 +219,27 @@ func TestProcessPoolUsesWarmProcessAndClosesIt(t *testing.T) {
 	p.close()
 	_ = process.Close()
 	select {
-	case <-process.stopped:
+	case <-process.done:
 	default:
 		t.Fatal("assigned process was not closed")
 	}
 }
 
-func TestProcessPoolEnforcesProcessLimit(t *testing.T) {
+func TestProcessPoolCreatesProcessesOnDemand(t *testing.T) {
 	factory, _ := testProcessFactory()
-	p := newProcessPool(config{MaxProcesses: 1}, factory)
+	p := newProcessPool(config{}, factory)
 	process, err := p.acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer process.Close()
-	if _, err := p.acquire(context.Background()); err != errProcessLimit {
-		t.Fatalf("second acquire error = %v, want %v", err, errProcessLimit)
+	second, err := p.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	if second == process {
+		t.Fatal("on-demand acquire reused an assigned process")
 	}
 	p.close()
 }

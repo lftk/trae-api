@@ -47,7 +47,7 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 	lease, err := s.acquireSession(r.Context(), externalID)
 	if err != nil {
 		status := http.StatusBadGateway
-		if errors.Is(err, errProcessLimit) || errors.Is(err, errSessionLimit) {
+		if errors.Is(err, errSessionLimit) {
 			status = http.StatusServiceUnavailable
 		}
 		writeError(w, status, err.Error())

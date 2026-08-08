@@ -23,7 +23,6 @@ type config struct {
 	ShutdownTimeout     time.Duration
 	WarmProcesses       int
 	MaxSessions         int
-	MaxProcesses        int
 }
 
 func loadConfig() (config, error) {
@@ -51,12 +50,8 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
-	maxProcesses, err := intFromEnv("TRAE_API_MAX_PROCESSES", 100)
-	if err != nil {
-		return config{}, err
-	}
-	if maxSessions < 0 || maxProcesses < 1 || warmProcesses > maxProcesses {
-		return config{}, errors.New("invalid session/process limits")
+	if maxSessions < 0 {
+		return config{}, errors.New("TRAE_API_MAX_SESSIONS must be non-negative")
 	}
 	yolo, err := boolFromEnv("TRAE_API_YOLO", true)
 	if err != nil {
@@ -88,7 +83,6 @@ func loadConfig() (config, error) {
 		ShutdownTimeout:     shutdownTimeout,
 		WarmProcesses:       warmProcesses,
 		MaxSessions:         maxSessions,
-		MaxProcesses:        maxProcesses,
 	}
 	if !isLoopbackAddr(cfg.Addr) && cfg.APIToken == "" {
 		if workdirTemp {
