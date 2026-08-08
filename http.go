@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -45,7 +46,11 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 	externalID := requestSessionID(r)
 	lease, err := s.acquireSession(r.Context(), externalID)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+		status := http.StatusBadGateway
+		if errors.Is(err, errProcessLimit) || errors.Is(err, errSessionLimit) {
+			status = http.StatusServiceUnavailable
+		}
+		writeError(w, status, err.Error())
 		return
 	}
 	defer lease.release()

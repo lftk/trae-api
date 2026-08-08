@@ -15,8 +15,7 @@ import (
 	acp "github.com/coder/acp-go-sdk"
 )
 
-// process is the lifetime of one trae-cli ACP connection. It can own
-// many independent ACP sessions.
+// process is the lifetime of one trae-cli ACP connection and its session.
 type process struct {
 	mu               sync.Mutex
 	cmd              *exec.Cmd
@@ -27,8 +26,14 @@ type process struct {
 	workdirTemp      bool
 	closeSupported   bool
 	done             chan struct{}
-	onDone           func()
-	closeOnce        sync.Once
+	onDone           []func()
+	doneOnce         sync.Once
+	stopOnce         sync.Once
+	stopErr          error
+	stopRequested    bool
+	stopped          chan struct{}
+	boundSession     acp.SessionId
+	sessionCreating  bool
 	newSessionFunc   func(context.Context) (*session, error)
 	closeSessionFunc func(context.Context, acp.SessionId) error
 }
@@ -45,6 +50,8 @@ type session struct {
 	workspaceNoticeSent bool
 	lastUsed            time.Time
 	updates             chan update
+	closed              bool
+	closeErr            error
 }
 
 type promptResult struct {
@@ -79,7 +86,7 @@ func startProcess(ctx context.Context, cfg config) (*process, error) {
 	p := &process{
 		cmd: cmd, stdin: stdin, workdir: workdir, workdirTemp: cfg.WorkdirTemp,
 		client: &client{sessions: make(map[acp.SessionId]*session)},
-		done:   make(chan struct{}),
+		done:   make(chan struct{}), stopped: make(chan struct{}),
 	}
 	p.conn = acp.NewClientSideConnection(p.client, stdin, stdout)
 	p.conn.SetLogger(slog.Default())
@@ -104,26 +111,28 @@ func startProcess(ctx context.Context, cfg config) (*process, error) {
 }
 
 func (p *process) wait() {
-	if err := p.cmd.Wait(); err != nil {
-		slog.Error("trae cli exited with error", "error", err)
-	}
-	p.closeOnce.Do(func() { close(p.done) })
+	err := p.cmd.Wait()
 	p.mu.Lock()
-	onDone := p.onDone
+	stopRequested := p.stopRequested
 	p.mu.Unlock()
-	if onDone != nil {
-		onDone()
+	if err != nil && !stopRequested {
+		slog.Error("trae cli exited with error", "error", err)
+	} else if err != nil {
+		slog.Debug("trae cli stopped", "error", err)
 	}
+	p.notifyDone()
 }
 
-func (p *process) setOnDone(fn func()) {
+func (p *process) addOnDone(fn func()) {
 	p.mu.Lock()
-	p.onDone = fn
 	dead := false
 	select {
 	case <-p.done:
 		dead = true
 	default:
+	}
+	if !dead {
+		p.onDone = append(p.onDone, fn)
 	}
 	p.mu.Unlock()
 	if dead {
@@ -131,20 +140,61 @@ func (p *process) setOnDone(fn func()) {
 	}
 }
 
+func (p *process) notifyDone() {
+	p.doneOnce.Do(func() {
+		close(p.done)
+		p.mu.Lock()
+		callbacks := append([]func(){}, p.onDone...)
+		p.mu.Unlock()
+		for _, callback := range callbacks {
+			callback()
+		}
+	})
+}
+
 func (p *process) newSession(ctx context.Context) (*session, error) {
+	p.mu.Lock()
+	if p.boundSession != "" || p.sessionCreating {
+		p.mu.Unlock()
+		return nil, errors.New("trae ACP process already has a session")
+	}
+	p.sessionCreating = true
+	p.mu.Unlock()
+	var (
+		s   *session
+		err error
+	)
 	if p.newSessionFunc != nil {
-		return p.newSessionFunc(ctx)
+		s, err = p.newSessionFunc(ctx)
+		if err == nil {
+			p.mu.Lock()
+			p.boundSession = s.session
+			p.sessionCreating = false
+			p.mu.Unlock()
+		}
+		if err != nil {
+			p.mu.Lock()
+			p.sessionCreating = false
+			p.mu.Unlock()
+		}
+		return s, err
 	}
 	select {
 	case <-p.done:
+		p.mu.Lock()
+		p.sessionCreating = false
+		p.mu.Unlock()
 		return nil, errors.New("trae ACP process is not running")
 	default:
 	}
 	created, err := p.conn.NewSession(ctx, acp.NewSessionRequest{Cwd: p.workdir, McpServers: []acp.McpServer{}})
 	if err != nil {
+		p.mu.Lock()
+		p.sessionCreating = false
+		p.mu.Unlock()
 		return nil, fmt.Errorf("acp new session: %w", err)
 	}
-	s := &session{process: p, session: created.SessionId, lastUsed: time.Now(), updates: make(chan update, 128)}
+	s = &session{process: p, session: created.SessionId, lastUsed: time.Now(), updates: make(chan update, 128)}
 	for _, option := range created.ConfigOptions {
 		if option.Select == nil || option.Select.Options.Ungrouped == nil {
 			continue
@@ -156,6 +206,10 @@ func (p *process) newSession(ctx context.Context) (*session, error) {
 			}
 		}
 	}
+	p.mu.Lock()
+	p.boundSession = s.session
+	p.sessionCreating = false
+	p.mu.Unlock()
 	p.client.addSession(s)
 	slog.Info("trae ACP session created", "sessionid", s.sessionID())
 	return s, nil
@@ -262,17 +316,32 @@ func responseText(answer, reasoning string) (string, string) {
 func (s *session) touchLocked() { s.lastUsed = time.Now() }
 
 func (s *session) Close() error {
+	s.mu.Lock()
+	if s.closed {
+		err := s.closeErr
+		s.mu.Unlock()
+		return err
+	}
+	s.closed = true
+	s.mu.Unlock()
+
 	s.process.client.removeSession(s.session)
+	var closeErr error
 	if !s.process.closeSupported && s.process.closeSessionFunc == nil {
-		slog.Warn("trae ACP does not support session/close; removed local session", "sessionid", s.sessionID())
-		return nil
+		slog.Warn("trae ACP does not support session/close; removing local session", "sessionid", s.sessionID())
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		closeErr = s.process.closeSession(ctx, s.session)
+		cancel()
+		if closeErr != nil {
+			closeErr = fmt.Errorf("close ACP session %s: %w", s.sessionID(), closeErr)
+		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := s.process.closeSession(ctx, s.session); err != nil {
-		return fmt.Errorf("close ACP session %s: %w", s.sessionID(), err)
-	}
-	return nil
+	closeErr = errors.Join(closeErr, s.process.Close())
+	s.mu.Lock()
+	s.closeErr = closeErr
+	s.mu.Unlock()
+	return closeErr
 }
 
 func (p *process) closeSession(ctx context.Context, id acp.SessionId) error {
@@ -284,14 +353,22 @@ func (p *process) closeSession(ctx context.Context, id acp.SessionId) error {
 }
 
 func (p *process) Close() error {
-	var closeErr error
-	if p.stdin != nil {
-		closeErr = errors.Join(closeErr, p.stdin.Close())
-	}
-	if p.cmd != nil && p.cmd.Process != nil {
-		if err := killProcess(p.cmd); err != nil && !errors.Is(err, os.ErrProcessDone) {
-			closeErr = errors.Join(closeErr, err)
+	p.stopOnce.Do(func() {
+		p.mu.Lock()
+		p.stopRequested = true
+		p.mu.Unlock()
+		if p.stdin != nil {
+			p.stopErr = errors.Join(p.stopErr, p.stdin.Close())
 		}
-	}
-	return closeErr
+		if p.cmd != nil && p.cmd.Process != nil {
+			if err := killProcess(p.cmd); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				p.stopErr = errors.Join(p.stopErr, err)
+			}
+		}
+		if p.stopped != nil {
+			close(p.stopped)
+		}
+	})
+	p.notifyDone()
+	return p.stopErr
 }

@@ -21,6 +21,9 @@ type config struct {
 	SessionIdleTimeout  time.Duration
 	SessionScanInterval time.Duration
 	ShutdownTimeout     time.Duration
+	WarmProcesses       int
+	MaxSessions         int
+	MaxProcesses        int
 }
 
 func loadConfig() (config, error) {
@@ -36,6 +39,24 @@ func loadConfig() (config, error) {
 	shutdownTimeout, err := durationFromEnv("TRAE_API_SHUTDOWN_TIMEOUT", 30*time.Second)
 	if err != nil {
 		return config{}, err
+	}
+	warmProcesses, err := intFromEnv("TRAE_API_WARM_PROCESSES", 1)
+	if err != nil {
+		return config{}, err
+	}
+	if warmProcesses < 0 {
+		return config{}, errors.New("TRAE_API_WARM_PROCESSES must be non-negative")
+	}
+	maxSessions, err := intFromEnv("TRAE_API_MAX_SESSIONS", 100)
+	if err != nil {
+		return config{}, err
+	}
+	maxProcesses, err := intFromEnv("TRAE_API_MAX_PROCESSES", 100)
+	if err != nil {
+		return config{}, err
+	}
+	if maxSessions < 0 || maxProcesses < 1 || warmProcesses > maxProcesses {
+		return config{}, errors.New("invalid session/process limits")
 	}
 	yolo, err := boolFromEnv("TRAE_API_YOLO", true)
 	if err != nil {
@@ -65,6 +86,9 @@ func loadConfig() (config, error) {
 		SessionIdleTimeout:  idleTimeout,
 		SessionScanInterval: scanInterval,
 		ShutdownTimeout:     shutdownTimeout,
+		WarmProcesses:       warmProcesses,
+		MaxSessions:         maxSessions,
+		MaxProcesses:        maxProcesses,
 	}
 	if !isLoopbackAddr(cfg.Addr) && cfg.APIToken == "" {
 		if workdirTemp {
@@ -73,6 +97,18 @@ func loadConfig() (config, error) {
 		return config{}, errors.New("TRAE_API_TOKEN is required when TRAE_API_ADDR is not loopback")
 	}
 	return cfg, nil
+}
+
+func intFromEnv(key string, fallback int) (int, error) {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("parse %s: %w", key, err)
+	}
+	return parsed, nil
 }
 
 func boolFromEnv(key string, fallback bool) (bool, error) {

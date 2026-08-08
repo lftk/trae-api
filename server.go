@@ -14,22 +14,13 @@ import (
 )
 
 type server struct {
-	cfg            config
-	mu             sync.Mutex
-	sessions       map[string]*session
-	pending        map[string]*sessionCreation
-	process        *process
-	processPending *processCreation
-	newProcess     func(context.Context, config) (*process, error)
-	stopScan       chan struct{}
-	scanDone       chan struct{}
-	stopOnce       sync.Once
-}
-
-type processCreation struct {
-	done    chan struct{}
-	process *process
-	err     error
+	cfg         config
+	sessions    *sessionManager
+	processPool *processPool
+	newProcess  func(context.Context, config) (*process, error)
+	stopScan    chan struct{}
+	scanDone    chan struct{}
+	stopOnce    sync.Once
 }
 
 type sessionCreation struct {
@@ -51,13 +42,15 @@ type modelListResponse struct {
 
 func newServer(cfg config) *server {
 	s := &server{
-		cfg:        cfg,
-		sessions:   make(map[string]*session),
-		pending:    make(map[string]*sessionCreation),
-		newProcess: startProcess,
-		stopScan:   make(chan struct{}),
-		scanDone:   make(chan struct{}),
+		cfg:      cfg,
+		sessions: newSessionManager(),
+		stopScan: make(chan struct{}),
+		scanDone: make(chan struct{}),
 	}
+	s.newProcess = startProcess
+	s.processPool = newProcessPool(cfg, func(ctx context.Context, cfg config) (*process, error) {
+		return s.newProcess(ctx, cfg)
+	})
 	if cfg.SessionIdleTimeout > 0 && cfg.SessionScanInterval > 0 {
 		go s.scanIdleSessions()
 	} else {
@@ -68,11 +61,7 @@ func newServer(cfg config) *server {
 
 func (s *server) acquireSession(ctx context.Context, id string) (*sessionLease, error) {
 	if id == "" {
-		process, err := s.ensureProcess(ctx)
-		if err != nil {
-			return nil, err
-		}
-		session, err := process.newSession(ctx)
+		session, err := s.createSession(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -88,21 +77,21 @@ func (s *server) acquireSession(ctx context.Context, id string) (*sessionLease, 
 			},
 		}, nil
 	}
-	s.mu.Lock()
-	if session := s.sessions[id]; session != nil {
+	s.sessions.mu.Lock()
+	if session := s.sessions.sessions[id]; session != nil {
 		select {
 		case <-session.process.done:
-			delete(s.sessions, id)
+			delete(s.sessions.sessions, id)
 		default:
 			session.mu.Lock()
 			session.touchLocked()
 			session.mu.Unlock()
-			s.mu.Unlock()
+			s.sessions.mu.Unlock()
 			return &sessionLease{session: session, id: id, release: func() {}}, nil
 		}
 	}
-	if creation := s.pending[id]; creation != nil {
-		s.mu.Unlock()
+	if creation := s.sessions.pending[id]; creation != nil {
+		s.sessions.mu.Unlock()
 		select {
 		case <-creation.done:
 			if creation.err != nil {
@@ -113,82 +102,52 @@ func (s *server) acquireSession(ctx context.Context, id string) (*sessionLease, 
 			return nil, ctx.Err()
 		}
 	}
-	creation := &sessionCreation{done: make(chan struct{})}
-	s.pending[id] = creation
-	s.mu.Unlock()
-
-	process, err := s.ensureProcess(ctx)
-	var session *session
-	if err == nil {
-		session, err = process.newSession(ctx)
+	if s.cfg.MaxSessions > 0 && len(s.sessions.sessions)+len(s.sessions.pending) >= s.cfg.MaxSessions {
+		s.sessions.mu.Unlock()
+		return nil, errSessionLimit
 	}
+	creation := &sessionCreation{done: make(chan struct{})}
+	s.sessions.pending[id] = creation
+	s.sessions.mu.Unlock()
 
-	s.mu.Lock()
-	delete(s.pending, id)
+	session, err := s.createSession(ctx)
+
+	s.sessions.mu.Lock()
+	delete(s.sessions.pending, id)
 	creation.session = session
 	creation.err = err
 	if err != nil {
 		close(creation.done)
-		s.mu.Unlock()
+		s.sessions.mu.Unlock()
 		return nil, err
 	}
-	s.sessions[id] = session
+	s.sessions.sessions[id] = session
 	close(creation.done)
-	s.mu.Unlock()
+	s.sessions.mu.Unlock()
+	session.process.addOnDone(func() { s.handleSessionDeath(id, session) })
 	return &sessionLease{session: session, id: id, release: func() {}}, nil
 }
 
-func (s *server) ensureProcess(ctx context.Context) (*process, error) {
-	s.mu.Lock()
-	if s.process != nil {
-		select {
-		case <-s.process.done:
-			s.process = nil
-		default:
-			p := s.process
-			s.mu.Unlock()
-			return p, nil
-		}
+func (s *server) createSession(ctx context.Context) (*session, error) {
+	p, err := s.processPool.acquire(ctx)
+	if err != nil {
+		return nil, err
 	}
-	if creation := s.processPending; creation != nil {
-		s.mu.Unlock()
-		select {
-		case <-creation.done:
-			return creation.process, creation.err
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+	session, err := p.newSession(ctx)
+	if err != nil {
+		_ = p.Close()
+		return nil, err
 	}
-	creation := &processCreation{done: make(chan struct{})}
-	s.processPending = creation
-	createProcess := s.newProcess
-	s.mu.Unlock()
-
-	p, err := createProcess(ctx, s.cfg)
-	s.mu.Lock()
-	s.processPending = nil
-	creation.process, creation.err = p, err
-	if err == nil {
-		s.process = p
-	}
-	close(creation.done)
-	s.mu.Unlock()
-	if err == nil {
-		p.setOnDone(func() { s.handleProcessDeath(p) })
-	}
-	return p, err
+	return session, nil
 }
 
-func (s *server) handleProcessDeath(process *process) {
-	s.mu.Lock()
-	if s.process == process {
-		s.process = nil
-		for id := range s.sessions {
-			delete(s.sessions, id)
-		}
-		slog.Error("shared trae ACP process failed; sessions invalidated")
+func (s *server) handleSessionDeath(id string, session *session) {
+	s.sessions.mu.Lock()
+	if s.sessions.sessions[id] == session {
+		delete(s.sessions.sessions, id)
+		slog.Error("trae ACP process failed; session invalidated", "sessionid", id, "acpsessionid", session.sessionID())
 	}
-	s.mu.Unlock()
+	s.sessions.mu.Unlock()
 }
 
 func (s *server) models(w http.ResponseWriter, r *http.Request) {
@@ -256,18 +215,18 @@ func (s *server) scanIdleSessions() {
 }
 
 func (s *server) reapIdleSessions(now time.Time) {
-	s.mu.Lock()
+	s.sessions.mu.Lock()
 	var toClose []*session
-	for id, session := range s.sessions {
+	for id, session := range s.sessions.sessions {
 		session.mu.Lock()
 		idle := now.Sub(session.lastUsed) > s.cfg.SessionIdleTimeout
 		session.mu.Unlock()
 		if idle {
 			toClose = append(toClose, session)
-			delete(s.sessions, id)
+			delete(s.sessions.sessions, id)
 		}
 	}
-	s.mu.Unlock()
+	s.sessions.mu.Unlock()
 	for _, session := range toClose {
 		_ = session.Close()
 	}
@@ -283,21 +242,15 @@ func (s *server) shutdown() {
 	case <-s.scanDone:
 	case <-time.After(scanTimeout):
 	}
-	s.mu.Lock()
-	sessions := make([]*session, 0, len(s.sessions))
-	for id, session := range s.sessions {
+	s.sessions.mu.Lock()
+	sessions := make([]*session, 0, len(s.sessions.sessions))
+	for id, session := range s.sessions.sessions {
 		sessions = append(sessions, session)
-		delete(s.sessions, id)
+		delete(s.sessions.sessions, id)
 	}
-	s.mu.Unlock()
+	s.sessions.mu.Unlock()
 	for _, session := range sessions {
 		_ = session.Close()
 	}
-	s.mu.Lock()
-	process := s.process
-	s.process = nil
-	s.mu.Unlock()
-	if process != nil {
-		_ = process.Close()
-	}
+	s.processPool.close()
 }
