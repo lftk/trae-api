@@ -23,12 +23,6 @@ type server struct {
 	stopOnce    sync.Once
 }
 
-type sessionCreation struct {
-	done    chan struct{}
-	session *session
-	err     error
-}
-
 type sessionLease struct {
 	session *session
 	id      string
@@ -77,54 +71,10 @@ func (s *server) acquireSession(ctx context.Context, id string) (*sessionLease, 
 			},
 		}, nil
 	}
-	s.sessions.mu.Lock()
-	if session := s.sessions.sessions[id]; session != nil {
-		select {
-		case <-session.process.done:
-			delete(s.sessions.sessions, id)
-		default:
-			session.mu.Lock()
-			session.touchLocked()
-			session.mu.Unlock()
-			s.sessions.mu.Unlock()
-			return &sessionLease{session: session, id: id, release: func() {}}, nil
-		}
-	}
-	if creation := s.sessions.pending[id]; creation != nil {
-		s.sessions.mu.Unlock()
-		select {
-		case <-creation.done:
-			if creation.err != nil {
-				return nil, creation.err
-			}
-			return &sessionLease{session: creation.session, id: id, release: func() {}}, nil
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-	if s.cfg.MaxSessions > 0 && len(s.sessions.sessions)+len(s.sessions.pending) >= s.cfg.MaxSessions {
-		s.sessions.mu.Unlock()
-		return nil, errSessionLimit
-	}
-	creation := &sessionCreation{done: make(chan struct{})}
-	s.sessions.pending[id] = creation
-	s.sessions.mu.Unlock()
-
-	session, err := s.createSession(ctx)
-
-	s.sessions.mu.Lock()
-	delete(s.sessions.pending, id)
-	creation.session = session
-	creation.err = err
+	session, err := s.sessions.getOrCreate(ctx, id, s.cfg.MaxSessions, s.createSession, s.handleSessionDeath)
 	if err != nil {
-		close(creation.done)
-		s.sessions.mu.Unlock()
 		return nil, err
 	}
-	s.sessions.sessions[id] = session
-	close(creation.done)
-	s.sessions.mu.Unlock()
-	session.process.addOnDone(func() { s.handleSessionDeath(id, session) })
 	return &sessionLease{session: session, id: id, release: func() {}}, nil
 }
 

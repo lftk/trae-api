@@ -26,6 +26,8 @@ type config struct {
 	MaxProcesses        int
 }
 
+const defaultWarmProcesses = 4
+
 func loadConfig() (config, error) {
 	var err error
 	idleTimeout, err := durationFromEnv("TRAE_API_SESSION_IDLE_TIMEOUT", 720*time.Hour)
@@ -40,7 +42,7 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
-	warmProcesses, err := intFromEnv("TRAE_API_WARM_PROCESSES", 1)
+	warmProcesses, err := intFromEnv("TRAE_API_WARM_PROCESSES", defaultWarmProcesses)
 	if err != nil {
 		return config{}, err
 	}
@@ -51,11 +53,14 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
-	maxProcesses, err := intFromEnv("TRAE_API_MAX_PROCESSES", 100)
+	if maxSessions < 0 {
+		return config{}, errors.New("TRAE_API_MAX_SESSIONS must be non-negative")
+	}
+	maxProcesses, err := intFromEnv("TRAE_API_MAX_PROCESSES", defaultMaxProcesses)
 	if err != nil {
 		return config{}, err
 	}
-	if maxSessions < 0 || maxProcesses < 1 || warmProcesses > maxProcesses {
+	if maxProcesses < 1 || warmProcesses > maxProcesses {
 		return config{}, errors.New("invalid session/process limits")
 	}
 	yolo, err := boolFromEnv("TRAE_API_YOLO", true)

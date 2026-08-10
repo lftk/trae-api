@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -19,7 +20,7 @@ func testProcessFactory() (func(context.Context, config) (*process, error), func
 		mu.Lock()
 		defer mu.Unlock()
 		created++
-		p := &process{done: make(chan struct{}), stopped: make(chan struct{}), client: &client{sessions: make(map[acp.SessionId]*session)}, workdirTemp: cfg.WorkdirTemp}
+		p := &process{done: make(chan struct{}), client: &client{sessions: make(map[acp.SessionId]*session)}, workdirTemp: cfg.WorkdirTemp}
 		var sequence int
 		p.newSessionFunc = func(context.Context) (*session, error) {
 			sequence++
@@ -96,12 +97,12 @@ func TestServerCreatesFreshACPSessionWithoutExternalID(t *testing.T) {
 		t.Fatalf("temporary ACP sessions remained: %d", len(p.client.sessions))
 	}
 	select {
-	case <-one.process.stopped:
+	case <-one.process.done:
 	default:
 		t.Fatal("first temporary session process was not closed")
 	}
 	select {
-	case <-two.process.stopped:
+	case <-two.process.done:
 	default:
 		t.Fatal("second temporary session process was not closed")
 	}
@@ -208,7 +209,7 @@ func TestTraeClientRoutesUpdatesByACPSessionID(t *testing.T) {
 
 func TestProcessPoolUsesWarmProcessAndClosesIt(t *testing.T) {
 	factory, _ := testProcessFactory()
-	p := newProcessPool(config{WarmProcesses: 1, MaxProcesses: 2}, factory)
+	p := newProcessPool(config{WarmProcesses: 1}, factory)
 	process, err := p.acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -219,22 +220,225 @@ func TestProcessPoolUsesWarmProcessAndClosesIt(t *testing.T) {
 	p.close()
 	_ = process.Close()
 	select {
-	case <-process.stopped:
+	case <-process.done:
 	default:
 		t.Fatal("assigned process was not closed")
 	}
 }
 
-func TestProcessPoolEnforcesProcessLimit(t *testing.T) {
+func TestProcessPoolCreatesProcessesOnDemand(t *testing.T) {
 	factory, _ := testProcessFactory()
-	p := newProcessPool(config{MaxProcesses: 1}, factory)
+	p := newProcessPool(config{}, factory)
 	process, err := p.acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer process.Close()
-	if _, err := p.acquire(context.Background()); err != errProcessLimit {
-		t.Fatalf("second acquire error = %v, want %v", err, errProcessLimit)
+	second, err := p.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	if second == process {
+		t.Fatal("on-demand acquire reused an assigned process")
 	}
 	p.close()
+}
+
+func TestProcessPoolConcurrentAcquireReturnsDistinctProcesses(t *testing.T) {
+	factory, _ := testProcessFactory()
+	p := newProcessPool(config{WarmProcesses: 1}, factory)
+	defer p.close()
+
+	const count = 8
+	results := make(chan *process, count)
+	errors := make(chan error, count)
+	var wg sync.WaitGroup
+	for range count {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			process, err := p.acquire(context.Background())
+			if err != nil {
+				errors <- err
+				return
+			}
+			results <- process
+		}()
+	}
+	wg.Wait()
+	close(results)
+	close(errors)
+
+	seen := make(map[*process]bool, count)
+	for process := range results {
+		if seen[process] {
+			t.Fatalf("process %p was acquired more than once", process)
+		}
+		seen[process] = true
+		_ = process.Close()
+	}
+	for err := range errors {
+		t.Fatal(err)
+	}
+	if len(seen) != count {
+		t.Fatalf("acquired %d processes, want %d", len(seen), count)
+	}
+}
+
+func TestProcessPoolRefillsWarmProcessAfterAcquire(t *testing.T) {
+	factory, current := testProcessFactory()
+	p := newProcessPool(config{WarmProcesses: 1}, factory)
+	defer p.close()
+
+	first, err := p.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, created := current(); created >= 2 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, created := current(); created < 2 {
+		t.Fatalf("warm process was not refilled, created %d processes", created)
+	}
+
+	second, err := p.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	if second == first {
+		t.Fatal("refilled acquire reused the assigned process")
+	}
+}
+
+func TestProcessPoolReplacesExitedWarmProcess(t *testing.T) {
+	factory, current := testProcessFactory()
+	p := newProcessPool(config{WarmProcesses: 1}, factory)
+	defer p.close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if process, created := current(); process != nil && created == 1 {
+			_ = process.Close()
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if process, created := current(); process == nil || created != 1 {
+		t.Fatalf("initial warm process was not created: process=%p created=%d", process, created)
+	}
+
+	for time.Now().Before(deadline) {
+		if _, created := current(); created >= 2 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, created := current(); created < 2 {
+		t.Fatalf("exited warm process was not replaced, created %d processes", created)
+	}
+}
+
+func TestProcessPoolAcquireContextCancelsWhileCreationIsPending(t *testing.T) {
+	baseFactory, _ := testProcessFactory()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce sync.Once
+	factory := func(ctx context.Context, cfg config) (*process, error) {
+		startedOnce.Do(func() { close(started) })
+		select {
+		case <-release:
+			return baseFactory(ctx, cfg)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	p := newProcessPool(config{}, factory)
+	defer p.close()
+
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := p.acquire(context.Background())
+		firstResult <- err
+	}()
+	<-started
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := p.acquire(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("pending acquire error = %v, want context deadline", err)
+	}
+
+	close(release)
+	if err := <-firstResult; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProcessPoolMaxProcessesBlocksInsteadOfCreating(t *testing.T) {
+	factory, current := testProcessFactory()
+	p := newProcessPool(config{MaxProcesses: 1}, factory)
+	defer p.close()
+
+	firstProcess, err := p.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	secondResult := make(chan struct {
+		process *process
+		err     error
+	}, 1)
+	go func() {
+		got, err := p.acquire(context.Background())
+		secondResult <- struct {
+			process *process
+			err     error
+		}{process: got, err: err}
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for p.waiting.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if p.waiting.Load() == 0 {
+		t.Fatal("second acquire did not start waiting")
+	}
+	if _, created := current(); created != 1 {
+		t.Fatalf("created %d processes, want 1", created)
+	}
+
+	_ = firstProcess.Close()
+	result := <-secondResult
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	if _, created := current(); created != 2 {
+		t.Fatalf("created %d processes after waiting acquire, want 2", created)
+	}
+	_ = result.process.Close()
+}
+
+func TestProcessPoolWarmZeroCreatesOnlyAfterDemand(t *testing.T) {
+	factory, current := testProcessFactory()
+	p := newProcessPool(config{WarmProcesses: 0, MaxProcesses: 1}, factory)
+	defer p.close()
+
+	if _, created := current(); created != 0 {
+		t.Fatalf("created %d processes before demand, want 0", created)
+	}
+	process, err := p.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer process.Close()
+	if _, created := current(); created != 1 {
+		t.Fatalf("created %d processes after demand, want 1", created)
+	}
 }

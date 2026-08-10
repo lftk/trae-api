@@ -31,7 +31,6 @@ type process struct {
 	stopOnce         sync.Once
 	stopErr          error
 	stopRequested    bool
-	stopped          chan struct{}
 	boundSession     acp.SessionId
 	sessionCreating  bool
 	newSessionFunc   func(context.Context) (*session, error)
@@ -86,7 +85,7 @@ func startProcess(ctx context.Context, cfg config) (*process, error) {
 	p := &process{
 		cmd: cmd, stdin: stdin, workdir: workdir, workdirTemp: cfg.WorkdirTemp,
 		client: &client{sessions: make(map[acp.SessionId]*session)},
-		done:   make(chan struct{}), stopped: make(chan struct{}),
+		done:   make(chan struct{}),
 	}
 	p.conn = acp.NewClientSideConnection(p.client, stdin, stdout)
 	p.conn.SetLogger(slog.Default())
@@ -212,21 +211,6 @@ func (p *process) newSession(ctx context.Context) (*session, error) {
 	p.mu.Unlock()
 	p.client.addSession(s)
 	slog.Info("trae ACP session created", "sessionid", s.sessionID())
-	return s, nil
-}
-
-// newSession remains a useful standalone constructor and is used as the
-// default server factory for compatibility with existing callers.
-func newSession(ctx context.Context, cfg config) (*session, error) {
-	p, err := startProcess(ctx, cfg)
-	if err != nil {
-		return nil, err
-	}
-	s, err := p.newSession(ctx)
-	if err != nil {
-		_ = p.Close()
-		return nil, err
-	}
 	return s, nil
 }
 
@@ -364,9 +348,6 @@ func (p *process) Close() error {
 			if err := killProcess(p.cmd); err != nil && !errors.Is(err, os.ErrProcessDone) {
 				p.stopErr = errors.Join(p.stopErr, err)
 			}
-		}
-		if p.stopped != nil {
-			close(p.stopped)
 		}
 	})
 	p.notifyDone()
