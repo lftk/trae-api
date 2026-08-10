@@ -32,8 +32,9 @@ trae-api
 | `TRAE_API_DEBUG` | `false` | 是否输出请求、响应和 ACP 调试日志 |
 | `TRAE_API_SESSION_IDLE_TIMEOUT` | `720h` | session 空闲过期时间 |
 | `TRAE_API_SESSION_SCAN_INTERVAL` | `1m` | session 过期扫描间隔 |
-| `TRAE_API_WARM_PROCESSES` | `1` | 后台预热的空闲 ACP 进程数，设为 `0` 禁用 |
+| `TRAE_API_WARM_PROCESSES` | `4` | 后台预热的空闲 ACP 进程数，设为 `0` 表示不启动预热 |
 | `TRAE_API_MAX_SESSIONS` | `100` | 稳定 session 数量上限 |
+| `TRAE_API_MAX_PROCESSES` | `100` | trae-cli ACP 进程总数上限 |
 
 未设置 `TRAE_API_WORKDIR` 时，服务创建的临时目录仅是 ACP 所需的隔离占位工作区，
 并不代表调用方的真实项目。每个 ACP session 的首次 prompt 会自动加入工作区声明，
@@ -63,8 +64,8 @@ curl http://127.0.0.1:8723/v1/chat/completions \
 
 每个逻辑 session 都独占一个 `trae-cli acp serve` 进程。服务启动后会在后台预热
 `TRAE_API_WARM_PROCESSES` 个已完成 ACP 初始化的空闲进程；稳定 session 优先领取
-预热进程，领取后后台补充池容量。池为空时才会按需冷启动，因此首次请求通常无需等待
-进程启动。进程池不再设置独立的进程总数上限，稳定 session 数量仍受
+预热进程，领取后由后台补充池容量。设置为 `0` 时不启动预热，但首次请求会触发后台
+创建。进程总数受 `TRAE_API_MAX_PROCESSES` 限制，达到上限时新的请求会等待已有进程结束；稳定 session 数量仍受
 `TRAE_API_MAX_SESSIONS` 限制。稳定的
 `X-Session-ID` 或 `X-Claude-Code-Session-Id` 会复用对应的 ACP session 和进程，
 不同 session 可以并发执行 prompt。首次请求需要承担进程启动和 ACP 初始化耗时；
