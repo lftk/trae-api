@@ -221,18 +221,33 @@ func processIsDone(process *process) bool {
 }
 
 func (p *processPool) close() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	p.closeWithContext(ctx)
+}
+
+func (p *processPool) closeWithContext(ctx context.Context) {
 	p.closeOnce.Do(func() {
 		p.fillMu.Lock()
 		p.cancel()
 		close(p.stop)
 		p.fillMu.Unlock()
 
-		p.wg.Wait()
+		waitDone := make(chan struct{})
+		go func() {
+			p.wg.Wait()
+			close(waitDone)
+		}()
+		select {
+		case <-waitDone:
+		case <-ctx.Done():
+			return
+		}
 		for {
 			select {
 			case entry := <-p.ready:
 				p.claim(entry)
-				_ = entry.process.Close()
+				_ = entry.process.closeWithContext(ctx)
 			default:
 				close(p.ready)
 				close(p.done)

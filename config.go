@@ -101,6 +101,11 @@ func loadConfig() (config, error) {
 		}
 		return config{}, errors.New("TRAE_API_TOKEN is required when TRAE_API_ADDR is not loopback")
 	}
+	if !workdirTemp {
+		if _, err := resolveWorkdir(workdir); err != nil {
+			return config{}, err
+		}
+	}
 	return cfg, nil
 }
 

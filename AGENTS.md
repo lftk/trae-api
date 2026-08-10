@@ -1,45 +1,31 @@
-# Repository Guidelines
+# Repository Instructions
 
-## Project Structure & Module Organization
+## Layout and Architecture
 
-This is a single-package Go service (`package main`) with no nested source or asset directories. The root files are organized by responsibility:
+- This is a single Go 1.23 module and a single root `package main`; keep implementation and tests in the repository root.
+- `main.go` wires configuration, HTTP routes, signal handling, and graceful shutdown. `config.go` is the source of truth for `TRAE_API_*` parsing and validation.
+- `http.go` exposes the OpenAI-compatible API; `server.go` coordinates lifecycle; `session.go` owns one `trae-cli acp serve` process/session; `acp_client.go` routes ACP notifications.
+- `process_pool.go` owns initialized, unassigned ACP processes. `session_manager.go` owns stable caller session IDs. A stable external session gets a dedicated process; an anonymous request gets a fresh process and is closed when the request ends.
+- Keep Unix/Windows process termination behavior in `process_unix.go` and `process_windows.go` respectively.
 
-- `main.go`: process startup, HTTP server, and shutdown handling.
-- `config.go`: `TRAE_API_*` environment configuration and validation.
-- `server.go`, `session.go`, and `acp_client.go`: session lifecycle and ACP integration.
-- `http.go` and `prompt.go`: OpenAI-compatible HTTP handlers and prompt conversion.
-- `process_unix.go` / `process_windows.go`: OS-specific process behavior.
-- `main_test.go`: unit and concurrency-oriented tests for the service.
-- `README.md`: local setup, API examples, and operational warnings.
+## Commands
 
-Keep new code in the root unless a feature clearly warrants a package; keep platform-specific behavior behind build-tagged files.
-
-## Build, Test, and Development Commands
-
-Run these from the repository root:
+Run from the repository root:
 
 ```bash
-gofmt -w *.go       # Format Go sources
-go test ./...       # Run the complete test suite
-go test -race ./... # Check concurrency-sensitive code
+gofmt -w *.go
+go test ./...
+go test -race ./...
 go build -o trae-api .
-go run .             # Start on 127.0.0.1:8723
+go run .
 ```
 
-The service requires an installed and authenticated `trae-cli`. Set `TRAE_API_WORKDIR` for a real project directory; use `TRAE_API_TOKEN` whenever binding beyond loopback. Treat the default `acp serve --yolo` arguments as trusted-local-only behavior.
+`trae-cli` must be installed and authenticated for the running service or integration test. The real CLI test is opt-in and makes model requests: `TRAE_API_RUN_INTEGRATION=1 go test -run TestTraeCLIAllowsConcurrentPromptsAcrossDedicatedProcesses ./...`.
 
-## Coding Style & Naming Conventions
+## Operational Constraints
 
-Follow standard Go formatting (`gofmt`) and idiomatic Go naming: exported identifiers use `PascalCase`, internal identifiers use `camelCase`, and acronyms remain capitalized (`HTTP`, `API`, `ACP`, `ID`). Prefer small functions, explicit error wrapping with context, and `context.Context` propagation. Use `slog` for service diagnostics rather than ad hoc output.
-
-## Testing Guidelines
-
-Use the standard `testing` package. Name tests `Test<Behavior>` and place them in `main_test.go` unless a new package is introduced. Cover configuration validation, HTTP behavior, session cleanup, and concurrent access; run `go test -race ./...` for changes involving session maps or goroutines.
-
-## Commit & Pull Request Guidelines
-
-No Git history or project-specific convention is available in this checkout. Use concise imperative commits, optionally scoped (for example, `fix: reap idle ACP sessions`). PRs should explain behavior changes, configuration or security impact, and testing performed. Include curl examples or screenshots when changing the HTTP API, and call out compatibility effects for Unix and Windows.
-
-## Security & Configuration Tips
-
-Do not expose a non-loopback listener without `TRAE_API_TOKEN`. Avoid committing tokens, local paths, generated binaries, or credentials. Review CLI permissions and network access before deploying the service outside a trusted local environment.
+- The default listener is loopback (`127.0.0.1:8723`). Binding a non-loopback address requires `TRAE_API_TOKEN`; authentication applies to every route.
+- `TRAE_API_WORKDIR` is required for real project-file access. If unset, startup creates a temporary isolation workspace that is removed on shutdown; do not infer project contents from it.
+- The default ACP command includes `acp serve --yolo`, so treat the service as trusted-local-only unless permissions and workdir are explicitly reviewed.
+- Stable sessions are in-memory and expire according to `TRAE_API_SESSION_IDLE_TIMEOUT` (default 720h), then are closed by the scan loop. Service restart loses all stable sessions.
+- `TRAE_API_WARM_PROCESSES=0` disables startup warming but the first demand still creates a process. `TRAE_API_MAX_PROCESSES` can make acquisition wait rather than create another process.

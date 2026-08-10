@@ -67,7 +67,7 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 	}
 	prompt := formatPrompt(req.Messages)
 	completionID := "chatcmpl-" + uuid.NewString()
-	slog.Debug("chat request", "method", r.Method, "path", r.URL.Path, "headers", debugHeaders(r.Header), "external_sessionid", externalID, "acp_sessionid", session.sessionID(), "completionid", completionID, "model", req.Model, "stream", req.Stream, "prompt", prompt)
+	slog.Debug("chat request", "method", r.Method, "path", r.URL.Path, "headers", debugHeaders(r.Header), "external_sessionid", externalID, "acp_sessionid", session.sessionID(), "completionid", completionID, "model", req.Model, "stream", req.Stream)
 	if req.Stream {
 		s.streamChat(w, r, session, completionID, externalID, req.Model, prompt)
 		return
@@ -100,7 +100,7 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 		Usage: openAIUsage(usage, sentPrompt, answer, reasoning),
 	}
 	writeJSONOrLog(w, http.StatusOK, response)
-	slog.Debug("chat response", "completionid", completionID, "external_sessionid", externalID, "acp_sessionid", session.sessionID(), "answer", answer, "reasoning", reasoning, "usage", response.Usage)
+	slog.Debug("chat response", "completionid", completionID, "external_sessionid", externalID, "acp_sessionid", session.sessionID(), "usage", response.Usage)
 	slog.Info("chat completed", "completionid", completionID, "sessionid", externalID, "acpsessionid", session.sessionID(), "elapsed", time.Since(started))
 }
 
@@ -185,7 +185,7 @@ func (s *server) streamChat(
 			flusher.Flush()
 		}
 	})
-	slog.Debug("stream response", "completionid", completionID, "external_sessionid", externalID, "acp_sessionid", session.sessionID(), "answer", answer, "reasoning", reasoning, "usage", usage, "error", err)
+	slog.Debug("stream response", "completionid", completionID, "external_sessionid", externalID, "acp_sessionid", session.sessionID(), "usage", usage, "error", err)
 	if streamErr != nil {
 		slog.Error("write chat completion stream", "completionid", completionID, "sessionid", externalID, "acpsessionid", session.sessionID(), "error", streamErr)
 		return

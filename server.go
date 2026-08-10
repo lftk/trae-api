@@ -75,7 +75,10 @@ func (s *server) acquireSession(ctx context.Context, id string) (*sessionLease, 
 	if err != nil {
 		return nil, err
 	}
-	return &sessionLease{session: session, id: id, release: func() {}}, nil
+	var once sync.Once
+	return &sessionLease{session: session, id: id, release: func() {
+		once.Do(func() { s.sessions.release(id, session) })
+	}}, nil
 }
 
 func (s *server) createSession(ctx context.Context) (*session, error) {
@@ -168,6 +171,9 @@ func (s *server) reapIdleSessions(now time.Time) {
 	s.sessions.mu.Lock()
 	var toClose []*session
 	for id, session := range s.sessions.sessions {
+		if session.leases != 0 {
+			continue
+		}
 		session.mu.Lock()
 		idle := now.Sub(session.lastUsed) > s.cfg.SessionIdleTimeout
 		session.mu.Unlock()
@@ -183,14 +189,23 @@ func (s *server) reapIdleSessions(now time.Time) {
 }
 
 func (s *server) shutdown() {
-	s.stopOnce.Do(func() { close(s.stopScan) })
-	scanTimeout := s.cfg.ShutdownTimeout
-	if scanTimeout <= 0 {
-		scanTimeout = 5 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout())
+	defer cancel()
+	s.shutdownWithContext(ctx)
+}
+
+func (s *server) shutdownTimeout() time.Duration {
+	if s.cfg.ShutdownTimeout <= 0 {
+		return 5 * time.Second
 	}
+	return s.cfg.ShutdownTimeout
+}
+
+func (s *server) shutdownWithContext(ctx context.Context) {
+	s.stopOnce.Do(func() { close(s.stopScan) })
 	select {
 	case <-s.scanDone:
-	case <-time.After(scanTimeout):
+	case <-ctx.Done():
 	}
 	s.sessions.mu.Lock()
 	sessions := make([]*session, 0, len(s.sessions.sessions))
@@ -200,7 +215,7 @@ func (s *server) shutdown() {
 	}
 	s.sessions.mu.Unlock()
 	for _, session := range sessions {
-		_ = session.Close()
+		_ = session.closeWithContext(ctx)
 	}
-	s.processPool.close()
+	s.processPool.closeWithContext(ctx)
 }

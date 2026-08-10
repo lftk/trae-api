@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"sync"
 )
 
@@ -43,6 +44,7 @@ func (m *sessionManager) getOrCreate(
 			session.mu.Lock()
 			session.touchLocked()
 			session.mu.Unlock()
+			session.leases++
 			m.mu.Unlock()
 			return session, nil
 		}
@@ -51,7 +53,15 @@ func (m *sessionManager) getOrCreate(
 		m.mu.Unlock()
 		select {
 		case <-creation.done:
-			return creation.session, creation.err
+			m.mu.Lock()
+			if creation.err == nil && m.sessions[id] == creation.session && !processIsDone(creation.session.process) {
+				creation.session.leases++
+			} else if creation.err == nil {
+				creation.err = errors.New("trae ACP process exited while creating session")
+			}
+			session, err := creation.session, creation.err
+			m.mu.Unlock()
+			return session, err
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
@@ -65,12 +75,19 @@ func (m *sessionManager) getOrCreate(
 	m.mu.Unlock()
 
 	session, err := create(ctx)
+	if err == nil && session == nil {
+		err = errors.New("session factory returned nil session")
+	}
+	if err == nil && processIsDone(session.process) {
+		err = errors.New("trae ACP process exited while creating session")
+	}
 
 	m.mu.Lock()
 	delete(m.pending, id)
 	creation.session = session
 	creation.err = err
 	if err == nil {
+		session.leases = 1
 		m.sessions[id] = session
 	}
 	close(creation.done)
@@ -80,4 +97,13 @@ func (m *sessionManager) getOrCreate(
 	}
 	session.process.addOnDone(func() { onDeath(id, session) })
 	return session, nil
+}
+
+func (m *sessionManager) release(id string, session *session) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sessions[id] != session || session.leases == 0 {
+		return
+	}
+	session.leases--
 }
