@@ -44,7 +44,20 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	externalID := requestSessionID(r)
-	lease, err := s.acquireSession(r.Context(), externalID)
+	var (
+		lease     *sessionLease
+		continued bool
+		err       error
+	)
+	if externalID != "" {
+		lease, err = s.acquireSession(r.Context(), externalID)
+	} else if s.cfg.ImplicitIdleTimeout > 0 {
+		// No session ID (for example VS Code chat): detect conversation
+		// continuity from the message transcript itself.
+		lease, continued, err = s.acquireImplicitSession(r.Context(), req.Messages)
+	} else {
+		lease, err = s.acquireSession(r.Context(), "")
+	}
 	if err != nil {
 		status := http.StatusBadGateway
 		if errors.Is(err, errSessionLimit) {
@@ -66,10 +79,15 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 		req.Model = selectedModel
 	}
 	prompt := formatPrompt(req.Messages)
+	if continued {
+		// The implicit session's ACP transcript already holds the shared
+		// history; only the trailing user message is new.
+		prompt = formatPrompt(req.Messages[len(req.Messages)-1:])
+	}
 	completionID := "chatcmpl-" + uuid.NewString()
-	slog.Debug("chat request", "method", r.Method, "path", r.URL.Path, "headers", debugHeaders(r.Header), "external_sessionid", externalID, "acp_sessionid", session.sessionID(), "completionid", completionID, "model", req.Model, "stream", req.Stream)
+	slog.Debug("chat request", "method", r.Method, "path", r.URL.Path, "headers", debugHeaders(r.Header), "external_sessionid", externalID, "acp_sessionid", session.sessionID(), "completionid", completionID, "model", req.Model, "stream", req.Stream, "implicit", lease.implicit, "continued", continued)
 	if req.Stream {
-		s.streamChat(w, r, session, completionID, externalID, req.Model, prompt)
+		s.streamChat(w, r, session, lease, completionID, externalID, req.Model, prompt, req.Messages)
 		return
 	}
 	answer, reasoning, usage, sentPrompt, err := session.prompt(r.Context(), prompt, nil)
@@ -77,6 +95,7 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	recordImplicitFingerprints(lease, req.Messages, answer)
 	if usage == nil {
 		w.Header().Set("X-Usage-Estimated", "true")
 	}
@@ -115,7 +134,9 @@ func (s *server) streamChat(
 	w http.ResponseWriter,
 	r *http.Request,
 	session *session,
+	lease *sessionLease,
 	completionID, externalID, model, prompt string,
+	requestMessages []openai.ChatCompletionMessage,
 ) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -198,6 +219,7 @@ func (s *server) streamChat(
 			},
 		})
 	} else {
+		recordImplicitFingerprints(lease, requestMessages, answer)
 		if usage == nil {
 			w.Header().Set("X-Usage-Estimated", "true")
 		}
@@ -245,6 +267,21 @@ func (s *server) streamChat(
 		return
 	}
 	flusher.Flush()
+}
+
+// recordImplicitFingerprints stores the transcript fingerprints used by
+// implicit-session continuity detection. Caller must hold session.mu (both
+// call sites run under it). Recording only happens for implicit leases and
+// only after the request succeeded, so a failed or half-streamed reply never
+// poisons the fingerprint used to recognize the next continuation.
+func recordImplicitFingerprints(lease *sessionLease, requestMessages []openai.ChatCompletionMessage, answer string) {
+	if lease == nil || !lease.implicit {
+		return
+	}
+	assistant := openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant, Content: answer}
+	userFP := fingerprintMessages(requestMessages)
+	fullFP := fingerprintMessages(append(append([]openai.ChatCompletionMessage(nil), requestMessages...), assistant))
+	lease.session.recordFingerprints(userFP, fullFP)
 }
 
 func debugHeaders(headers http.Header) map[string][]string {

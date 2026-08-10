@@ -5,7 +5,7 @@
 - This is a single Go 1.23 module and a single root `package main`; keep implementation and tests in the repository root.
 - `main.go` wires configuration, HTTP routes, signal handling, and graceful shutdown. `config.go` is the source of truth for `TRAE_API_*` parsing and validation.
 - `http.go` exposes the OpenAI-compatible API; `server.go` coordinates lifecycle; `session.go` owns one `trae-cli acp serve` process/session; `acp_client.go` routes ACP notifications.
-- `process_pool.go` owns initialized, unassigned ACP processes. `session_manager.go` owns stable caller session IDs. A stable external session gets a dedicated process; an anonymous request gets a fresh process and is closed when the request ends.
+- `process_pool.go` owns initialized, unassigned ACP processes. `session_manager.go` owns stable caller session IDs. A stable external session gets a dedicated process; an anonymous request gets a fresh process and is closed when the request ends. When `TRAE_API_IMPLICIT_SESSION_IDLE_TIMEOUT` is non-zero, anonymous requests are instead routed through `acquireImplicitSession`: message-transcript fingerprints (`session.lastUserFP`/`lastFullFP`, see `fingerprintMessages`) detect conversation continuity so an anonymous client like VS Code Chat reuses a dedicated process; sessions idle-reap after the implicit timeout.
 - Keep Unix/Windows process termination behavior in `process_unix.go` and `process_windows.go` respectively.
 
 ## Commands
