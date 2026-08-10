@@ -63,13 +63,19 @@ func (c *client) SessionUpdate(ctx context.Context, n acp.SessionNotification) e
 	if s == nil {
 		return fmt.Errorf("unknown ACP session %s", n.SessionId)
 	}
+	s.updatesMu.RLock()
+	updates := s.updates
+	s.updatesMu.RUnlock()
+	if updates == nil {
+		return nil
+	}
 	if n.Update.AgentMessageChunk != nil && n.Update.AgentMessageChunk.Content.Text != nil {
-		slog.Debug("ACP agent message chunk", "acp_sessionid", n.SessionId, "text", n.Update.AgentMessageChunk.Content.Text.Text)
-		return c.sendUpdate(ctx, s.updates, update{Text: n.Update.AgentMessageChunk.Content.Text.Text})
+		slog.Debug("ACP agent message chunk", "acp_sessionid", n.SessionId)
+		return c.sendUpdate(ctx, updates, update{Text: n.Update.AgentMessageChunk.Content.Text.Text})
 	}
 	if n.Update.AgentThoughtChunk != nil && n.Update.AgentThoughtChunk.Content.Text != nil {
-		slog.Debug("ACP agent thought chunk", "acp_sessionid", n.SessionId, "text", n.Update.AgentThoughtChunk.Content.Text.Text)
-		return c.sendUpdate(ctx, s.updates, update{Text: n.Update.AgentThoughtChunk.Content.Text.Text, Reasoning: true})
+		slog.Debug("ACP agent thought chunk", "acp_sessionid", n.SessionId)
+		return c.sendUpdate(ctx, updates, update{Text: n.Update.AgentThoughtChunk.Content.Text.Text, Reasoning: true})
 	}
 	return nil
 }
@@ -80,5 +86,9 @@ func (c *client) sendUpdate(ctx context.Context, updates chan update, item updat
 		return nil
 	case <-ctx.Done():
 		return fmt.Errorf("deliver session update: %w", ctx.Err())
+	default:
+		// ACP notifications must not block the connection reader when the
+		// HTTP client has gone away or the prompt queue is being discarded.
+		return nil
 	}
 }

@@ -169,6 +169,7 @@ func TestReapIdleSessionClosesSupportedACPSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	session, id := lease.session, lease.id
+	lease.release()
 	p, _ := current()
 	p.closeSupported = true
 	var closed acp.SessionId
@@ -181,6 +182,27 @@ func TestReapIdleSessionClosesSupportedACPSession(t *testing.T) {
 	if _, ok := s.sessions.sessions[id]; ok {
 		t.Fatal("idle session remained in server map")
 	}
+}
+
+func TestReapIdleSessionDoesNotCloseLeasedSession(t *testing.T) {
+	factory, current := testProcessFactory()
+	s := newServer(config{SessionIdleTimeout: time.Minute})
+	s.newProcess = factory
+	lease, err := s.acquireSession(context.Background(), "active-client")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := lease.session
+	session.lastUsed = time.Now().Add(-2 * time.Minute)
+	s.reapIdleSessions(time.Now())
+	if _, ok := s.sessions.sessions["active-client"]; !ok {
+		t.Fatal("leased session was reaped")
+	}
+	if process, _ := current(); processIsDone(process) {
+		t.Fatal("leased session process was closed")
+	}
+	lease.release()
+	s.reapIdleSessions(time.Now())
 }
 
 func TestTraeClientRoutesUpdatesByACPSessionID(t *testing.T) {
@@ -204,6 +226,23 @@ func TestTraeClientRoutesUpdatesByACPSessionID(t *testing.T) {
 	}
 	if got := (<-b.updates).Text; got != "only-b" {
 		t.Fatalf("session b received %q", got)
+	}
+}
+
+func TestTraeClientDropsUpdatesWithoutActivePrompt(t *testing.T) {
+	c := &client{sessions: make(map[acp.SessionId]*session)}
+	s := &session{session: "inactive"}
+	c.addSession(s)
+	n := acp.SessionNotification{SessionId: s.session, Update: acp.SessionUpdate{
+		AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{Content: acp.TextBlock("late")},
+	}}
+	if err := c.SessionUpdate(context.Background(), n); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-s.updates:
+		t.Fatalf("received inactive update %q", got.Text)
+	default:
 	}
 }
 

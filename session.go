@@ -35,6 +35,8 @@ type process struct {
 	sessionCreating  bool
 	newSessionFunc   func(context.Context) (*session, error)
 	closeSessionFunc func(context.Context, acp.SessionId) error
+	exitDone         chan struct{}
+	exitOnce         sync.Once
 }
 
 // session is deliberately only session-scoped state. The HTTP session ID
@@ -49,8 +51,12 @@ type session struct {
 	workspaceNoticeSent bool
 	lastUsed            time.Time
 	updates             chan update
+	updatesMu           sync.RWMutex
+	promptMu            sync.Mutex
 	closed              bool
 	closeErr            error
+	closeDone           chan struct{}
+	leases              int
 }
 
 type promptResult struct {
@@ -85,7 +91,7 @@ func startProcess(ctx context.Context, cfg config) (*process, error) {
 	p := &process{
 		cmd: cmd, stdin: stdin, workdir: workdir, workdirTemp: cfg.WorkdirTemp,
 		client: &client{sessions: make(map[acp.SessionId]*session)},
-		done:   make(chan struct{}),
+		done:   make(chan struct{}), exitDone: make(chan struct{}),
 	}
 	p.conn = acp.NewClientSideConnection(p.client, stdin, stdout)
 	p.conn.SetLogger(slog.Default())
@@ -119,7 +125,17 @@ func (p *process) wait() {
 	} else if err != nil {
 		slog.Debug("trae cli stopped", "error", err)
 	}
-	p.notifyDone()
+	p.markExited()
+}
+
+func (p *process) markExited() {
+	p.exitOnce.Do(func() {
+		if p.exitDone == nil {
+			p.exitDone = make(chan struct{})
+		}
+		close(p.exitDone)
+		p.notifyDone()
+	})
 }
 
 func (p *process) addOnDone(fn func()) {
@@ -166,6 +182,12 @@ func (p *process) newSession(ctx context.Context) (*session, error) {
 	if p.newSessionFunc != nil {
 		s, err = p.newSessionFunc(ctx)
 		if err == nil {
+			if processIsDone(p) {
+				p.mu.Lock()
+				p.sessionCreating = false
+				p.mu.Unlock()
+				return nil, errors.New("trae ACP process exited while creating session")
+			}
 			p.mu.Lock()
 			p.boundSession = s.session
 			p.sessionCreating = false
@@ -206,6 +228,11 @@ func (p *process) newSession(ctx context.Context) (*session, error) {
 		}
 	}
 	p.mu.Lock()
+	if processIsDone(p) {
+		p.sessionCreating = false
+		p.mu.Unlock()
+		return nil, errors.New("trae ACP process exited while creating session")
+	}
 	p.boundSession = s.session
 	p.sessionCreating = false
 	p.mu.Unlock()
@@ -246,8 +273,21 @@ func (s *session) setModel(ctx context.Context, model string) (string, error) {
 }
 
 func (s *session) prompt(ctx context.Context, text string, stream func(update)) (string, string, *acp.Usage, string, error) {
+	s.promptMu.Lock()
+	defer s.promptMu.Unlock()
 	s.lastUsed = time.Now()
 	text = s.preparePrompt(text)
+	updates := make(chan update, 128)
+	s.updatesMu.Lock()
+	s.updates = updates
+	s.updatesMu.Unlock()
+	defer func() {
+		s.updatesMu.Lock()
+		if s.updates == updates {
+			s.updates = nil
+		}
+		s.updatesMu.Unlock()
+	}()
 	done := make(chan promptResult, 1)
 	go func() {
 		response, err := s.process.conn.Prompt(ctx, acp.PromptRequest{SessionId: s.session, Prompt: []acp.ContentBlock{acp.TextBlock(text)}})
@@ -266,7 +306,7 @@ func (s *session) prompt(ctx context.Context, text string, stream func(update)) 
 	}
 	for {
 		select {
-		case item := <-s.updates:
+		case item := <-updates:
 			consume(item)
 		case result := <-done:
 			if result.err != nil {
@@ -274,7 +314,7 @@ func (s *session) prompt(ctx context.Context, text string, stream func(update)) 
 			}
 			for {
 				select {
-				case item := <-s.updates:
+				case item := <-updates:
 					consume(item)
 				case <-ctx.Done():
 					a, r := responseText(answer.String(), reasoning.String())
@@ -285,7 +325,11 @@ func (s *session) prompt(ctx context.Context, text string, stream func(update)) 
 				}
 			}
 		case <-ctx.Done():
-			return answer.String(), reasoning.String(), nil, text, ctx.Err()
+			// Wait for ACP to finish before allowing this session to accept a
+			// new prompt. This prevents late notifications from crossing the
+			// request boundary.
+			result := <-done
+			return answer.String(), reasoning.String(), result.usage, text, ctx.Err()
 		}
 	}
 }
@@ -300,13 +344,25 @@ func responseText(answer, reasoning string) (string, string) {
 func (s *session) touchLocked() { s.lastUsed = time.Now() }
 
 func (s *session) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return s.closeWithContext(ctx)
+}
+
+func (s *session) closeWithContext(ctx context.Context) error {
 	s.mu.Lock()
 	if s.closed {
+		done := s.closeDone
 		err := s.closeErr
+		s.mu.Unlock()
+		<-done
+		s.mu.Lock()
+		err = s.closeErr
 		s.mu.Unlock()
 		return err
 	}
 	s.closed = true
+	s.closeDone = make(chan struct{})
 	s.mu.Unlock()
 
 	s.process.client.removeSession(s.session)
@@ -314,16 +370,15 @@ func (s *session) Close() error {
 	if !s.process.closeSupported && s.process.closeSessionFunc == nil {
 		slog.Warn("trae ACP does not support session/close; removing local session", "sessionid", s.sessionID())
 	} else {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		closeErr = s.process.closeSession(ctx, s.session)
-		cancel()
 		if closeErr != nil {
 			closeErr = fmt.Errorf("close ACP session %s: %w", s.sessionID(), closeErr)
 		}
 	}
-	closeErr = errors.Join(closeErr, s.process.Close())
+	closeErr = errors.Join(closeErr, s.process.closeWithContext(ctx))
 	s.mu.Lock()
 	s.closeErr = closeErr
+	close(s.closeDone)
 	s.mu.Unlock()
 	return closeErr
 }
@@ -337,19 +392,44 @@ func (p *process) closeSession(ctx context.Context, id acp.SessionId) error {
 }
 
 func (p *process) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return p.closeWithContext(ctx)
+}
+
+func (p *process) closeWithContext(ctx context.Context) error {
 	p.stopOnce.Do(func() {
 		p.mu.Lock()
 		p.stopRequested = true
 		p.mu.Unlock()
+		var stopErr error
 		if p.stdin != nil {
-			p.stopErr = errors.Join(p.stopErr, p.stdin.Close())
+			stopErr = errors.Join(stopErr, p.stdin.Close())
 		}
 		if p.cmd != nil && p.cmd.Process != nil {
 			if err := killProcess(p.cmd); err != nil && !errors.Is(err, os.ErrProcessDone) {
-				p.stopErr = errors.Join(p.stopErr, err)
+				stopErr = errors.Join(stopErr, err)
 			}
 		}
+		p.mu.Lock()
+		p.stopErr = errors.Join(p.stopErr, stopErr)
+		p.mu.Unlock()
+		if p.cmd == nil {
+			p.markExited()
+		}
 	})
-	p.notifyDone()
-	return p.stopErr
+	if p.exitDone == nil {
+		p.markExited()
+	}
+	select {
+	case <-p.exitDone:
+	case <-ctx.Done():
+		p.mu.Lock()
+		p.stopErr = errors.Join(p.stopErr, ctx.Err())
+		p.mu.Unlock()
+	}
+	p.mu.Lock()
+	err := p.stopErr
+	p.mu.Unlock()
+	return err
 }
