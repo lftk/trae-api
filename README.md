@@ -54,13 +54,13 @@ curl http://127.0.0.1:8723/v1/chat/completions \
 
 支持：
 
-- `GET /healthz`
+- `GET /healthz`（返回 `sessions` 与 `implicit_sessions` 数量，便于观察会话复用）
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 - 文本消息和流式响应（`"stream": true`）
 - 使用请求头 `X-Session-ID` 复用会话；匿名请求不会自动返回可复用的 session ID
 - Claude Code 可直接使用其 `X-Claude-Code-Session-Id` 请求头复用会话（Claude Code 2.1.86+）
-- 无 session ID 的请求（如 VS Code Chat）通过消息历史指纹自动识别会话延续：请求的消息前缀与某个隐式会话的已记录 transcript 一致时，复用该会话的 ACP 进程，只发送新增消息；重放相同请求、编辑历史或新对话则创建新会话并携带完整消息历史。隐式会话在 `TRAE_API_IMPLICIT_SESSION_IDLE_TIMEOUT`（默认 30 分钟）空闲后回收，设为 `0` 恢复“每次请求创建并立即销毁临时会话”的旧行为
+- 无 session ID 的请求（如 VS Code Chat）通过消息历史指纹自动识别会话延续：请求的消息前缀与某个隐式会话的已记录 transcript 一致时，复用该会话的 ACP 进程，只发送新增消息；重放相同请求、编辑历史或新对话则创建新会话并携带完整消息历史。进行中的隐式会话不会被共享：相同指纹的并发请求（如两个客户端出现相同对话）各自获得独立会话，被替换的会话在请求结束后关闭。隐式会话在 `TRAE_API_IMPLICIT_SESSION_IDLE_TIMEOUT`（默认 30 分钟）空闲后回收，设为 `0` 恢复“每次请求创建并立即销毁临时会话”的旧行为
 
 当前不支持图片等结构化消息。默认启动参数包含 `--yolo`，仅建议在受信任的本机项目目录中使用。
 

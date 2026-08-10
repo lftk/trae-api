@@ -105,20 +105,45 @@ func (s *server) acquireImplicitSession(ctx context.Context, messages []openai.C
 			return implicitLease(session, s.implicit), true, nil
 		}
 	}
-	// Replaying the exact previous request (retry or regenerate without
-	// edits) must start a fresh session: the registered one already contains
-	// that prompt in its transcript.
-	if session := s.implicit.evictByUserFP(fp); session != nil {
-		slog.Info("implicit session replaced for replayed request", "acpsessionid", session.sessionID())
-		if err := session.Close(); err != nil {
-			slog.Warn("close replaced implicit session", "sessionid", session.sessionID(), "error", err)
-		}
-	}
-	session, err := s.implicit.getOrCreate(ctx, formatFingerprint(fp), s.cfg.MaxSessions, s.createSession, s.handleImplicitDeath)
+	session, err := s.createImplicitSession(ctx, formatFingerprint(fp))
 	if err != nil {
 		return nil, false, err
 	}
 	return implicitLease(session, s.implicit), false, nil
+}
+
+// createImplicitSession always starts a fresh session and never shares an
+// existing entry under the same fingerprint key. Replaying the exact previous
+// request (retry or regenerate without edits) replaces the idle session whose
+// transcript already contains that prompt; an entry still leased by an
+// in-flight request is replaced as well and closes once that request releases
+// it (see releaseBySession). Two clients with identical conversations can
+// therefore never prompt into the same transcript.
+func (s *server) createImplicitSession(ctx context.Context, key string) (*session, error) {
+	if s.cfg.MaxSessions > 0 && s.implicit.count() >= s.cfg.MaxSessions {
+		return nil, errSessionLimit
+	}
+	sess, err := s.createSession(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var replaced *session
+	s.implicit.mu.Lock()
+	if old := s.implicit.sessions[key]; old != nil {
+		delete(s.implicit.sessions, key)
+		replaced = old
+	}
+	s.implicit.sessions[key] = sess
+	sess.leases = 1
+	s.implicit.mu.Unlock()
+	if replaced != nil && replaced.leases == 0 {
+		slog.Info("implicit session replaced for replayed request", "acpsessionid", replaced.sessionID())
+		if err := replaced.Close(); err != nil {
+			slog.Warn("close replaced implicit session", "sessionid", replaced.sessionID(), "error", err)
+		}
+	}
+	sess.process.addOnDone(func() { s.handleImplicitDeath(key, sess) })
+	return sess, nil
 }
 
 func implicitLease(session *session, manager *sessionManager) *sessionLease {

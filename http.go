@@ -120,7 +120,7 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSONOrLog(w, http.StatusOK, response)
 	slog.Debug("chat response", "completionid", completionID, "external_sessionid", externalID, "acp_sessionid", session.sessionID(), "usage", response.Usage)
-	slog.Info("chat completed", "completionid", completionID, "sessionid", externalID, "acpsessionid", session.sessionID(), "elapsed", time.Since(started))
+	slog.Info("chat completed", "completionid", completionID, "sessionid", externalID, "acpsessionid", session.sessionID(), "implicit", lease.implicit, "continued", continued, "elapsed", time.Since(started))
 }
 
 func requestSessionID(r *http.Request) string {
@@ -365,7 +365,11 @@ func estimateTokens(text string) int {
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSONOrLog(w, http.StatusOK, map[string]string{"status": "ok"})
+		writeJSONOrLog(w, http.StatusOK, map[string]any{
+			"status":            "ok",
+			"sessions":          s.sessions.count(),
+			"implicit_sessions": s.implicit.count(),
+		})
 	})
 	mux.HandleFunc("GET /v1/models", s.models)
 	mux.HandleFunc("POST /v1/chat/completions", s.chat)

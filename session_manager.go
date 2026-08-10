@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -29,6 +30,12 @@ func newSessionManager(idleTimeout time.Duration) *sessionManager {
 		pending:     make(map[string]*sessionCreation),
 		idleTimeout: idleTimeout,
 	}
+}
+
+func (m *sessionManager) count() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.sessions)
 }
 
 func (m *sessionManager) getOrCreate(
@@ -113,8 +120,11 @@ func (m *sessionManager) release(id string, session *session) {
 
 // takeContinuation leases the implicit session whose recorded transcript
 // (lastFullFP) matches prefixFP, re-keying it to newUserFP. It returns nil
-// when no live session continues the transcript. When several sessions match
-// (identical conversations from different clients), the most recently used
+// when no live session continues the transcript. Candidates that are already
+// leased are skipped: a session is only a valid continuation target after its
+// own request finished, so a leased match means a different client with an
+// identical conversation (fingerprint collision) — sharing its transcript
+// would cross-talk. When several idle sessions match, the most recently used
 // one wins; the others are left for their next request to replace.
 func (m *sessionManager) takeContinuation(prefixFP, newUserFP uint64) (*session, error) {
 	m.mu.Lock()
@@ -122,6 +132,9 @@ func (m *sessionManager) takeContinuation(prefixFP, newUserFP uint64) (*session,
 	var best *session
 	var bestUsed time.Time
 	for key, candidate := range m.sessions {
+		if candidate.leases != 0 {
+			continue
+		}
 		candidate.mu.Lock()
 		match := candidate.lastFullFP == prefixFP
 		used := candidate.lastUsed
@@ -152,30 +165,29 @@ func (m *sessionManager) takeContinuation(prefixFP, newUserFP uint64) (*session,
 	return best, nil
 }
 
-// evictByUserFP removes and returns the session registered under the exact
-// request fingerprint, when it is not in flight. A repeat of the identical
-// request must not reuse the session: its transcript already contains that
-// prompt, so replaying it would duplicate the turn. The caller closes the
-// returned session and creates a fresh one.
-func (m *sessionManager) evictByUserFP(fp uint64) *session {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	key := formatFingerprint(fp)
-	session := m.sessions[key]
-	if session == nil || session.leases != 0 {
-		return nil
-	}
-	delete(m.sessions, key)
-	return session
-}
-
 // releaseBySession releases a lease by session identity, tolerating the
 // manager key changing between acquisition (continuation re-key) and release.
+// A session that was replaced while its request was still in flight is no
+// longer in the map; once its last lease drains it is closed here.
 func (m *sessionManager) releaseBySession(session *session) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if session.leases == 0 {
+		m.mu.Unlock()
 		return
 	}
 	session.leases--
+	orphaned := session.leases == 0
+	if orphaned {
+		for _, s := range m.sessions {
+			if s == session {
+				orphaned = false
+				break
+			}
+		}
+	}
+	m.mu.Unlock()
+	if orphaned {
+		slog.Info("close replaced implicit session after lease drained", "acpsessionid", session.sessionID())
+		_ = session.Close()
+	}
 }
