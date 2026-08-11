@@ -31,6 +31,7 @@ trae-api
 | `TRAE_API_YOLO` | `true` | 是否以 `--yolo` 启动 ACP |
 | `TRAE_API_DEBUG` | `false` | 是否输出请求、响应和 ACP 调试日志 |
 | `TRAE_API_SESSION_IDLE_TIMEOUT` | `720h` | session 空闲过期时间 |
+| `TRAE_API_IMPLICIT_SESSION_IDLE_TIMEOUT` | `30m` | 无 session ID 请求的隐式会话空闲过期时间，设为 `0` 禁用隐式会话 |
 | `TRAE_API_SESSION_SCAN_INTERVAL` | `1m` | session 过期扫描间隔 |
 | `TRAE_API_WARM_PROCESSES` | `4` | 后台预热的空闲 ACP 进程数，设为 `0` 表示不启动预热 |
 | `TRAE_API_MAX_SESSIONS` | `100` | 稳定 session 数量上限 |
@@ -53,12 +54,13 @@ curl http://127.0.0.1:8723/v1/chat/completions \
 
 支持：
 
-- `GET /healthz`
+- `GET /healthz`（返回 `sessions` 与 `implicit_sessions` 数量，便于观察会话复用）
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 - 文本消息和流式响应（`"stream": true`）
 - 使用请求头 `X-Session-ID` 复用会话；匿名请求不会自动返回可复用的 session ID
 - Claude Code 可直接使用其 `X-Claude-Code-Session-Id` 请求头复用会话（Claude Code 2.1.86+）
+- 无 session ID 的请求（如 VS Code Chat）通过消息历史指纹自动识别会话延续：请求的消息前缀与某个隐式会话的已记录 transcript 一致时，复用该会话的 ACP 进程，只发送新增消息；重放相同请求、编辑历史或新对话则创建新会话并携带完整消息历史。进行中的隐式会话不会被共享：相同指纹的并发请求（如两个客户端出现相同对话）各自获得独立会话，被替换的会话在请求结束后关闭。隐式会话在 `TRAE_API_IMPLICIT_SESSION_IDLE_TIMEOUT`（默认 30 分钟）空闲后回收，设为 `0` 恢复“每次请求创建并立即销毁临时会话”的旧行为
 
 当前不支持图片等结构化消息。默认启动参数包含 `--yolo`，仅建议在受信任的本机项目目录中使用。
 
@@ -82,5 +84,5 @@ session。
 
 无 session ID 的请求应在每次请求中携带完整消息历史。显式 session ID 的首次请求
 可以携带初始上下文，后续请求只需携带新增消息，历史由 ACP session 保存。服务端
-不会保存或比较 transcript。若 ACP 不支持 `session/close`，临时 session 的本地
+不会保存或比较 transcript（隐式会话只保存消息序列的指纹）。若 ACP 不支持 `session/close`，临时 session 的本地
 引用和对应的 trae-cli 进程都会在请求结束时释放。

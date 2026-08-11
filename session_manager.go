@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
+	"time"
 )
 
 type sessionCreation struct {
@@ -16,16 +18,24 @@ type sessionCreation struct {
 // session/process pair. It deliberately does not own ACP transport or process
 // pooling; those lifecycles belong to processPool and process.
 type sessionManager struct {
-	mu       sync.Mutex
-	sessions map[string]*session
-	pending  map[string]*sessionCreation
+	mu          sync.Mutex
+	sessions    map[string]*session
+	pending     map[string]*sessionCreation
+	idleTimeout time.Duration
 }
 
-func newSessionManager() *sessionManager {
+func newSessionManager(idleTimeout time.Duration) *sessionManager {
 	return &sessionManager{
-		sessions: make(map[string]*session),
-		pending:  make(map[string]*sessionCreation),
+		sessions:    make(map[string]*session),
+		pending:     make(map[string]*sessionCreation),
+		idleTimeout: idleTimeout,
 	}
+}
+
+func (m *sessionManager) count() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.sessions)
 }
 
 func (m *sessionManager) getOrCreate(
@@ -106,4 +116,78 @@ func (m *sessionManager) release(id string, session *session) {
 		return
 	}
 	session.leases--
+}
+
+// takeContinuation leases the implicit session whose recorded transcript
+// (lastFullFP) matches prefixFP, re-keying it to newUserFP. It returns nil
+// when no live session continues the transcript. Candidates that are already
+// leased are skipped: a session is only a valid continuation target after its
+// own request finished, so a leased match means a different client with an
+// identical conversation (fingerprint collision) — sharing its transcript
+// would cross-talk. When several idle sessions match, the most recently used
+// one wins; the others are left for their next request to replace.
+func (m *sessionManager) takeContinuation(prefixFP, newUserFP uint64) (*session, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var best *session
+	var bestUsed time.Time
+	for key, candidate := range m.sessions {
+		if candidate.leases != 0 {
+			continue
+		}
+		candidate.mu.Lock()
+		match := candidate.lastFullFP == prefixFP
+		used := candidate.lastUsed
+		candidate.mu.Unlock()
+		if !match {
+			continue
+		}
+		if processIsDone(candidate.process) {
+			delete(m.sessions, key)
+			continue
+		}
+		if best == nil || used.After(bestUsed) {
+			best, bestUsed = candidate, used
+		}
+	}
+	if best == nil {
+		return nil, nil
+	}
+	best.mu.Lock()
+	delete(m.sessions, formatFingerprint(best.lastUserFP))
+	best.lastUserFP = newUserFP
+	best.mu.Unlock()
+	m.sessions[formatFingerprint(newUserFP)] = best
+	best.leases++
+	best.mu.Lock()
+	best.touchLocked()
+	best.mu.Unlock()
+	return best, nil
+}
+
+// releaseBySession releases a lease by session identity, tolerating the
+// manager key changing between acquisition (continuation re-key) and release.
+// A session that was replaced while its request was still in flight is no
+// longer in the map; once its last lease drains it is closed here.
+func (m *sessionManager) releaseBySession(session *session) {
+	m.mu.Lock()
+	if session.leases == 0 {
+		m.mu.Unlock()
+		return
+	}
+	session.leases--
+	orphaned := session.leases == 0
+	if orphaned {
+		for _, s := range m.sessions {
+			if s == session {
+				orphaned = false
+				break
+			}
+		}
+	}
+	m.mu.Unlock()
+	if orphaned {
+		slog.Info("close replaced implicit session after lease drained", "acpsessionid", session.sessionID())
+		_ = session.Close()
+	}
 }

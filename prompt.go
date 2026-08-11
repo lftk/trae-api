@@ -1,7 +1,11 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
+	"io"
+	"strconv"
 	"strings"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -53,4 +57,23 @@ func messageText(message openai.ChatCompletionMessage) string {
 		}
 	}
 	return b.String()
+}
+
+// fingerprintMessages hashes a message sequence (role + text content) for
+// implicit-session continuity detection. Clients without a session ID (for
+// example VS Code chat) resend the full transcript on every request; a request
+// whose prefix matches the transcript of a live implicit session continues it.
+func fingerprintMessages(messages []openai.ChatCompletionMessage) uint64 {
+	h := sha256.New()
+	for _, message := range messages {
+		_, _ = io.WriteString(h, message.Role)
+		h.Write([]byte{0})
+		_, _ = io.WriteString(h, messageText(message))
+		h.Write([]byte{0})
+	}
+	return binary.BigEndian.Uint64(h.Sum(nil)[:8])
+}
+
+func formatFingerprint(fp uint64) string {
+	return strconv.FormatUint(fp, 16)
 }

@@ -57,6 +57,11 @@ type session struct {
 	closeErr            error
 	closeDone           chan struct{}
 	leases              int
+	// lastUserFP hashes the request messages that produced the current
+	// transcript; lastFullFP also includes the assistant reply. Guarded by
+	// session.mu. Used only by implicit-session continuity detection.
+	lastUserFP uint64
+	lastFullFP uint64
 }
 
 type promptResult struct {
@@ -342,6 +347,13 @@ func responseText(answer, reasoning string) (string, string) {
 }
 
 func (s *session) touchLocked() { s.lastUsed = time.Now() }
+
+// recordFingerprints updates the transcript fingerprints used by
+// implicit-session continuity detection. Caller must hold session.mu.
+func (s *session) recordFingerprints(userFP, fullFP uint64) {
+	s.lastUserFP = userFP
+	s.lastFullFP = fullFP
+}
 
 func (s *session) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

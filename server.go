@@ -16,6 +16,7 @@ import (
 type server struct {
 	cfg         config
 	sessions    *sessionManager
+	implicit    *sessionManager
 	processPool *processPool
 	newProcess  func(context.Context, config) (*process, error)
 	stopScan    chan struct{}
@@ -24,9 +25,10 @@ type server struct {
 }
 
 type sessionLease struct {
-	session *session
-	id      string
-	release func()
+	session  *session
+	id       string
+	implicit bool
+	release  func()
 }
 
 type modelListResponse struct {
@@ -37,7 +39,8 @@ type modelListResponse struct {
 func newServer(cfg config) *server {
 	s := &server{
 		cfg:      cfg,
-		sessions: newSessionManager(),
+		sessions: newSessionManager(cfg.SessionIdleTimeout),
+		implicit: newSessionManager(cfg.ImplicitIdleTimeout),
 		stopScan: make(chan struct{}),
 		scanDone: make(chan struct{}),
 	}
@@ -55,6 +58,10 @@ func newServer(cfg config) *server {
 
 func (s *server) acquireSession(ctx context.Context, id string) (*sessionLease, error) {
 	if id == "" {
+		// Implicit sessions are enabled: chat() routes anonymous requests
+		// through acquireImplicitSession. This branch only serves the
+		// disabled configuration and keeps the historical behavior of
+		// closing the temporary session as soon as the request ends.
 		session, err := s.createSession(ctx)
 		if err != nil {
 			return nil, err
@@ -81,6 +88,79 @@ func (s *server) acquireSession(ctx context.Context, id string) (*sessionLease, 
 	}}, nil
 }
 
+// acquireImplicitSession maps an anonymous request to a live implicit session
+// when the request continues that session's transcript (its message prefix
+// hashes to the session's recorded transcript fingerprint). Otherwise it
+// starts a new implicit session. It reports whether the caller may prompt
+// with only the trailing user message instead of the full history.
+func (s *server) acquireImplicitSession(ctx context.Context, messages []openai.ChatCompletionMessage) (*sessionLease, bool, error) {
+	fp := fingerprintMessages(messages)
+	last := messages[len(messages)-1]
+	canContinue := len(messages) >= 2 && last.Role == openai.ChatMessageRoleUser
+	if canContinue {
+		prefixFP := fingerprintMessages(messages[:len(messages)-1])
+		if session, err := s.implicit.takeContinuation(prefixFP, fp); err != nil {
+			return nil, false, err
+		} else if session != nil {
+			return implicitLease(session, s.implicit), true, nil
+		}
+	}
+	session, err := s.createImplicitSession(ctx, formatFingerprint(fp))
+	if err != nil {
+		return nil, false, err
+	}
+	return implicitLease(session, s.implicit), false, nil
+}
+
+// createImplicitSession always starts a fresh session and never shares an
+// existing entry under the same fingerprint key. Replaying the exact previous
+// request (retry or regenerate without edits) replaces the idle session whose
+// transcript already contains that prompt; an entry still leased by an
+// in-flight request is replaced as well and closes once that request releases
+// it (see releaseBySession). Two clients with identical conversations can
+// therefore never prompt into the same transcript.
+func (s *server) createImplicitSession(ctx context.Context, key string) (*session, error) {
+	if s.cfg.MaxSessions > 0 && s.implicit.count() >= s.cfg.MaxSessions {
+		return nil, errSessionLimit
+	}
+	sess, err := s.createSession(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var replaced *session
+	s.implicit.mu.Lock()
+	if old := s.implicit.sessions[key]; old != nil {
+		delete(s.implicit.sessions, key)
+		replaced = old
+	}
+	s.implicit.sessions[key] = sess
+	sess.leases = 1
+	s.implicit.mu.Unlock()
+	if replaced != nil && replaced.leases == 0 {
+		slog.Info("implicit session replaced for replayed request", "acpsessionid", replaced.sessionID())
+		if err := replaced.Close(); err != nil {
+			slog.Warn("close replaced implicit session", "sessionid", replaced.sessionID(), "error", err)
+		}
+	}
+	sess.process.addOnDone(func() { s.handleImplicitDeath(key, sess) })
+	return sess, nil
+}
+
+func implicitLease(session *session, manager *sessionManager) *sessionLease {
+	var once sync.Once
+	session.mu.Lock()
+	id := formatFingerprint(session.lastUserFP)
+	session.mu.Unlock()
+	return &sessionLease{
+		session:  session,
+		id:       id,
+		implicit: true,
+		release: func() {
+			once.Do(func() { manager.releaseBySession(session) })
+		},
+	}
+}
+
 func (s *server) createSession(ctx context.Context) (*session, error) {
 	p, err := s.processPool.acquire(ctx)
 	if err != nil {
@@ -101,6 +181,15 @@ func (s *server) handleSessionDeath(id string, session *session) {
 		slog.Error("trae ACP process failed; session invalidated", "sessionid", id, "acpsessionid", session.sessionID())
 	}
 	s.sessions.mu.Unlock()
+}
+
+func (s *server) handleImplicitDeath(id string, session *session) {
+	s.implicit.mu.Lock()
+	if s.implicit.sessions[id] == session {
+		delete(s.implicit.sessions, id)
+		slog.Error("trae ACP process failed; implicit session invalidated", "acpsessionid", session.sessionID())
+	}
+	s.implicit.mu.Unlock()
 }
 
 func (s *server) models(w http.ResponseWriter, r *http.Request) {
@@ -168,21 +257,28 @@ func (s *server) scanIdleSessions() {
 }
 
 func (s *server) reapIdleSessions(now time.Time) {
-	s.sessions.mu.Lock()
+	s.reapManager(now, s.sessions)
+	if s.cfg.ImplicitIdleTimeout > 0 {
+		s.reapManager(now, s.implicit)
+	}
+}
+
+func (s *server) reapManager(now time.Time, manager *sessionManager) {
+	manager.mu.Lock()
 	var toClose []*session
-	for id, session := range s.sessions.sessions {
+	for id, session := range manager.sessions {
 		if session.leases != 0 {
 			continue
 		}
 		session.mu.Lock()
-		idle := now.Sub(session.lastUsed) > s.cfg.SessionIdleTimeout
+		idle := now.Sub(session.lastUsed) > manager.idleTimeout
 		session.mu.Unlock()
 		if idle {
 			toClose = append(toClose, session)
-			delete(s.sessions.sessions, id)
+			delete(manager.sessions, id)
 		}
 	}
-	s.sessions.mu.Unlock()
+	manager.mu.Unlock()
 	for _, session := range toClose {
 		_ = session.Close()
 	}
@@ -207,15 +303,20 @@ func (s *server) shutdownWithContext(ctx context.Context) {
 	case <-s.scanDone:
 	case <-ctx.Done():
 	}
-	s.sessions.mu.Lock()
-	sessions := make([]*session, 0, len(s.sessions.sessions))
-	for id, session := range s.sessions.sessions {
+	s.closeSessions(ctx, s.sessions)
+	s.closeSessions(ctx, s.implicit)
+	s.processPool.closeWithContext(ctx)
+}
+
+func (s *server) closeSessions(ctx context.Context, manager *sessionManager) {
+	manager.mu.Lock()
+	sessions := make([]*session, 0, len(manager.sessions))
+	for id, session := range manager.sessions {
 		sessions = append(sessions, session)
-		delete(s.sessions.sessions, id)
+		delete(manager.sessions, id)
 	}
-	s.sessions.mu.Unlock()
+	manager.mu.Unlock()
 	for _, session := range sessions {
 		_ = session.closeWithContext(ctx)
 	}
-	s.processPool.closeWithContext(ctx)
 }

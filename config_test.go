@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestLoadConfigProcessLimits(t *testing.T) {
 	t.Setenv("TRAE_API_WORKDIR", t.TempDir())
@@ -33,6 +36,35 @@ func TestLoadConfigProcessLimits(t *testing.T) {
 		t.Setenv("TRAE_API_WARM_PROCESSES", "2")
 		if _, err := loadConfig(); err == nil {
 			t.Fatal("loadConfig succeeded with warm processes above max")
+		}
+	})
+
+	t.Run("implicit session timeout defaults to 30m", func(t *testing.T) {
+		t.Setenv("TRAE_API_IMPLICIT_SESSION_IDLE_TIMEOUT", "")
+		cfg, err := loadConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.ImplicitIdleTimeout != 30*time.Minute {
+			t.Fatalf("implicit session timeout = %s, want 30m0s", cfg.ImplicitIdleTimeout)
+		}
+	})
+
+	t.Run("implicit session timeout can be zero to disable", func(t *testing.T) {
+		t.Setenv("TRAE_API_IMPLICIT_SESSION_IDLE_TIMEOUT", "0")
+		cfg, err := loadConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.ImplicitIdleTimeout != 0 {
+			t.Fatalf("implicit session timeout = %s, want 0s", cfg.ImplicitIdleTimeout)
+		}
+	})
+
+	t.Run("implicit session timeout must not be negative", func(t *testing.T) {
+		t.Setenv("TRAE_API_IMPLICIT_SESSION_IDLE_TIMEOUT", "-1m")
+		if _, err := loadConfig(); err == nil {
+			t.Fatal("loadConfig succeeded with negative implicit session timeout")
 		}
 	})
 }
