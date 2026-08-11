@@ -161,21 +161,11 @@ func (s *server) streamChat(
 		}
 		return true
 	}
-	initial := openai.ChatCompletionStreamResponse{
-		ID:      completionID,
-		Object:  "chat.completion.chunk",
-		Created: time.Now().Unix(),
-		Model:   model,
-		Choices: []openai.ChatCompletionStreamChoice{{
-			Index: 0,
-			Delta: openai.ChatCompletionStreamChoiceDelta{
-				Role: openai.ChatMessageRoleAssistant,
-			},
-			FinishReason: openai.FinishReasonNull,
-		}},
-	}
+	initial := streamChunk(completionID, model, openai.ChatCompletionStreamChoiceDelta{
+		Role: openai.ChatMessageRoleAssistant,
+	}, openai.FinishReasonNull)
 	if !tryWrite(initial) {
-		slog.Error("write chat completion stream", "completionid", completionID, "sessionid", externalID, "acpsessionid", session.sessionID(), "error", streamErr)
+		s.logStreamError(completionID, externalID, session, streamErr)
 		return
 	}
 	flusher.Flush()
@@ -186,29 +176,19 @@ func (s *server) streamChat(
 		if !item.Reasoning {
 			sawAnswer = sawAnswer || item.Text != ""
 		}
-		chunk := openai.ChatCompletionStreamResponse{
-			ID:      completionID,
-			Object:  "chat.completion.chunk",
-			Created: time.Now().Unix(),
-			Model:   model,
-			Choices: []openai.ChatCompletionStreamChoice{{
-				Index:        0,
-				Delta:        openai.ChatCompletionStreamChoiceDelta{},
-				FinishReason: openai.FinishReasonNull,
-			}},
-		}
+		delta := openai.ChatCompletionStreamChoiceDelta{}
 		if item.Reasoning {
-			chunk.Choices[0].Delta.ReasoningContent = item.Text
+			delta.ReasoningContent = item.Text
 		} else {
-			chunk.Choices[0].Delta.Content = item.Text
+			delta.Content = item.Text
 		}
-		if tryWrite(chunk) {
+		if tryWrite(streamChunk(completionID, model, delta, openai.FinishReasonNull)) {
 			flusher.Flush()
 		}
 	})
 	slog.Debug("stream response", "completionid", completionID, "external_sessionid", externalID, "acp_sessionid", session.sessionID(), "usage", usage, "error", err)
 	if streamErr != nil {
-		slog.Error("write chat completion stream", "completionid", completionID, "sessionid", externalID, "acpsessionid", session.sessionID(), "error", streamErr)
+		s.logStreamError(completionID, externalID, session, streamErr)
 		return
 	}
 	if err != nil {
@@ -227,46 +207,40 @@ func (s *server) streamChat(
 		// answer after the stream callback has already run. Send that fallback
 		// answer now so a proxy/client does not finish with an empty response.
 		if !sawAnswer && answer != "" {
-			tryWrite(openai.ChatCompletionStreamResponse{
-				ID:      completionID,
-				Object:  "chat.completion.chunk",
-				Created: time.Now().Unix(),
-				Model:   model,
-				Choices: []openai.ChatCompletionStreamChoice{{
-					Index: 0,
-					Delta: openai.ChatCompletionStreamChoiceDelta{
-						Content: answer,
-					},
-					FinishReason: openai.FinishReasonNull,
-				}},
-			})
+			tryWrite(streamChunk(completionID, model, openai.ChatCompletionStreamChoiceDelta{
+				Content: answer,
+			}, openai.FinishReasonNull))
 		}
-		final := openai.ChatCompletionStreamResponse{
-			ID:      completionID,
-			Object:  "chat.completion.chunk",
-			Created: time.Now().Unix(),
-			Model:   model,
-			Choices: []openai.ChatCompletionStreamChoice{{
-				Index:        0,
-				Delta:        openai.ChatCompletionStreamChoiceDelta{},
-				FinishReason: openai.FinishReasonStop,
-			}},
-		}
-		if usage != nil {
-			final.Usage = openAIUsagePtr(usage, sentPrompt, answer, reasoning)
-		} else {
-			estimated := openAIUsage(usage, sentPrompt, answer, reasoning)
-			final.Usage = &estimated
-		}
+		final := streamChunk(completionID, model, openai.ChatCompletionStreamChoiceDelta{}, openai.FinishReasonStop)
+		final.Usage = openAIUsagePtr(usage, sentPrompt, answer, reasoning)
 		if tryWrite(final) {
 			_, streamErr = io.WriteString(w, "data: [DONE]\n\n")
 		}
 	}
 	if streamErr != nil {
-		slog.Error("write chat completion stream", "completionid", completionID, "sessionid", externalID, "acpsessionid", session.sessionID(), "error", streamErr)
+		s.logStreamError(completionID, externalID, session, streamErr)
 		return
 	}
 	flusher.Flush()
+}
+
+func (s *server) logStreamError(completionID, externalID string, session *session, err error) {
+	slog.Error("write chat completion stream", "completionid", completionID, "sessionid", externalID, "acpsessionid", session.sessionID(), "error", err)
+}
+
+// streamChunk builds a chat.completion.chunk response with the given delta.
+func streamChunk(completionID, model string, delta openai.ChatCompletionStreamChoiceDelta, finish openai.FinishReason) openai.ChatCompletionStreamResponse {
+	return openai.ChatCompletionStreamResponse{
+		ID:      completionID,
+		Object:  "chat.completion.chunk",
+		Created: time.Now().Unix(),
+		Model:   model,
+		Choices: []openai.ChatCompletionStreamChoice{{
+			Index:        0,
+			Delta:        delta,
+			FinishReason: finish,
+		}},
+	}
 }
 
 // recordImplicitFingerprints stores the transcript fingerprints used by
@@ -279,9 +253,10 @@ func recordImplicitFingerprints(lease *sessionLease, requestMessages []openai.Ch
 		return
 	}
 	assistant := openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant, Content: answer}
-	userFP := fingerprintMessages(requestMessages)
-	fullFP := fingerprintMessages(append(append([]openai.ChatCompletionMessage(nil), requestMessages...), assistant))
-	lease.session.recordFingerprints(userFP, fullFP)
+	full := make([]openai.ChatCompletionMessage, 0, len(requestMessages)+1)
+	full = append(full, requestMessages...)
+	full = append(full, assistant)
+	lease.session.recordFingerprints(fingerprintMessages(requestMessages), fingerprintMessages(full))
 }
 
 func debugHeaders(headers http.Header) map[string][]string {
@@ -328,10 +303,9 @@ func openAIUsage(usage *acp.Usage, prompt, answer, reasoning string) openai.Usag
 	return result
 }
 
+// openAIUsagePtr converts ACP usage to OpenAI usage, estimating the token
+// counts when the agent did not report usage.
 func openAIUsagePtr(usage *acp.Usage, prompt, answer, reasoning string) *openai.Usage {
-	if usage == nil {
-		return nil
-	}
 	result := openAIUsage(usage, prompt, answer, reasoning)
 	return &result
 }
@@ -375,6 +349,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /v1/chat/completions", s.chat)
 	return authMiddleware(s.cfg.APIToken, mux)
 }
+
 func authMiddleware(token string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if token != "" && r.Header.Get("Authorization") != "Bearer "+token {
@@ -384,6 +359,7 @@ func authMiddleware(token string, next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+
 func writeSSE(w io.Writer, value any) error {
 	data, err := json.Marshal(value)
 	if err != nil {
@@ -403,16 +379,21 @@ func writeJSON(w http.ResponseWriter, status int, value any) error {
 	return nil
 }
 func writeError(w http.ResponseWriter, status int, message string) {
+	errorType := "invalid_request_error"
+	if status >= 500 {
+		errorType = "server_error"
+	}
 	response := openai.ErrorResponse{
 		Error: &openai.APIError{
 			Message: message,
-			Type:    "invalid_request_error",
+			Type:    errorType,
 		},
 	}
 	if err := writeJSON(w, status, response); err != nil {
 		slog.Error("write error response", "error", err)
 	}
 }
+
 func writeJSONOrLog(w http.ResponseWriter, status int, value any) {
 	if err := writeJSON(w, status, value); err != nil {
 		slog.Error("write JSON response", "error", err)

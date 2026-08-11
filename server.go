@@ -193,24 +193,9 @@ func (s *server) handleImplicitDeath(id string, session *session) {
 }
 
 func (s *server) models(w http.ResponseWriter, r *http.Request) {
-	var models []string
-	workdir, err := resolveWorkdir(s.cfg.Workdir)
+	models, err := s.listModels(r.Context())
 	if err != nil {
-		slog.Warn("resolve workdir for models", "error", err)
-	} else {
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-		defer cancel()
-		cmd := exec.CommandContext(ctx, s.cfg.TraeBin, "models")
-		cmd.Dir = workdir
-		if output, err := cmd.Output(); err == nil {
-			if parsed, parseErr := parseModels(output); parseErr == nil {
-				models = parsed
-			} else {
-				slog.Warn("parse trae models", "error", parseErr)
-			}
-		} else {
-			slog.Warn("list trae models", "error", err)
-		}
+		slog.Warn("list trae models", "error", err)
 	}
 	data := make([]openai.Model, 0, len(models))
 	for _, model := range models {
@@ -219,9 +204,27 @@ func (s *server) models(w http.ResponseWriter, r *http.Request) {
 	writeJSONOrLog(w, http.StatusOK, modelListResponse{Object: "list", Data: data})
 }
 
+// listModels queries trae-cli for the available models, preferring the JSON
+// output format with a line-based fallback.
+func (s *server) listModels(ctx context.Context) ([]string, error) {
+	workdir, err := resolveWorkdir(s.cfg.Workdir)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, s.cfg.TraeBin, "models")
+	cmd.Dir = workdir
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	return parseModels(output)
+}
+
 func parseModels(output []byte) ([]string, error) {
 	var decoded []openai.Model
-	if json.Unmarshal(output, &decoded) == nil {
+	if err := json.Unmarshal(output, &decoded); err == nil {
 		models := make([]string, 0, len(decoded))
 		for _, item := range decoded {
 			if item.ID != "" {
@@ -235,9 +238,6 @@ func parseModels(output []byte) ([]string, error) {
 		if model := strings.TrimSpace(line); model != "" {
 			models = append(models, model)
 		}
-	}
-	if len(models) == 0 {
-		return []string{}, nil
 	}
 	return models, nil
 }

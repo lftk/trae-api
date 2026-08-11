@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"strconv"
 	"strings"
 
@@ -66,9 +65,9 @@ func messageText(message openai.ChatCompletionMessage) string {
 func fingerprintMessages(messages []openai.ChatCompletionMessage) uint64 {
 	h := sha256.New()
 	for _, message := range messages {
-		_, _ = io.WriteString(h, message.Role)
+		h.Write([]byte(message.Role))
 		h.Write([]byte{0})
-		_, _ = io.WriteString(h, messageText(message))
+		h.Write([]byte(messageText(message)))
 		h.Write([]byte{0})
 	}
 	return binary.BigEndian.Uint64(h.Sum(nil)[:8])

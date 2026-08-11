@@ -137,28 +137,27 @@ func (p *processPool) fillTarget(target int) {
 func (p *processPool) create() {
 	defer p.wg.Done()
 	process, err := p.factory(p.ctx, p.cfg)
-	if err != nil || process == nil || p.isStopping() {
-		if process != nil {
+	if process != nil && err == nil && !p.isStopping() {
+		entry := &pooledProcess{process: process}
+		p.observe(entry)
+		select {
+		case p.ready <- entry:
+		case <-p.stop:
+			p.claim(entry)
 			_ = process.Close()
-		}
-		p.releaseProcessSlot()
-		p.releaseWarmSlot()
-		if err != nil && !errors.Is(err, context.Canceled) && !p.isStopping() {
-			slog.Warn("create trae ACP process failed", "error", err)
-		}
-		if !p.isStopping() {
-			time.AfterFunc(100*time.Millisecond, p.refill)
 		}
 		return
 	}
-
-	entry := &pooledProcess{process: process}
-	p.observe(entry)
-	select {
-	case p.ready <- entry:
-	case <-p.stop:
-		p.claim(entry)
+	if process != nil {
 		_ = process.Close()
+	}
+	p.releaseProcessSlot()
+	p.releaseWarmSlot()
+	if err != nil && !errors.Is(err, context.Canceled) && !p.isStopping() {
+		slog.Warn("create trae ACP process failed", "error", err)
+	}
+	if !p.isStopping() {
+		time.AfterFunc(100*time.Millisecond, p.refill)
 	}
 }
 

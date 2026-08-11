@@ -30,16 +30,15 @@ type config struct {
 const defaultWarmProcesses = 4
 
 func loadConfig() (config, error) {
-	var err error
-	idleTimeout, err := durationFromEnv("TRAE_API_SESSION_IDLE_TIMEOUT", 720*time.Hour)
+	idleTimeout, err := durationFromEnv("TRAE_API_SESSION_IDLE_TIMEOUT", 720*time.Hour, false)
 	if err != nil {
 		return config{}, err
 	}
-	scanInterval, err := durationFromEnv("TRAE_API_SESSION_SCAN_INTERVAL", time.Minute)
+	scanInterval, err := durationFromEnv("TRAE_API_SESSION_SCAN_INTERVAL", time.Minute, false)
 	if err != nil {
 		return config{}, err
 	}
-	shutdownTimeout, err := durationFromEnv("TRAE_API_SHUTDOWN_TIMEOUT", 30*time.Second)
+	shutdownTimeout, err := durationFromEnv("TRAE_API_SHUTDOWN_TIMEOUT", 30*time.Second, false)
 	if err != nil {
 		return config{}, err
 	}
@@ -61,10 +60,13 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
-	if maxProcesses < 1 || warmProcesses > maxProcesses {
-		return config{}, errors.New("invalid session/process limits")
+	if maxProcesses < 1 {
+		return config{}, errors.New("TRAE_API_MAX_PROCESSES must be at least 1")
 	}
-	implicitIdleTimeout, err := durationFromEnvAllowZero("TRAE_API_IMPLICIT_SESSION_IDLE_TIMEOUT", 30*time.Minute)
+	if warmProcesses > maxProcesses {
+		return config{}, errors.New("TRAE_API_WARM_PROCESSES must not exceed TRAE_API_MAX_PROCESSES")
+	}
+	implicitIdleTimeout, err := durationFromEnv("TRAE_API_IMPLICIT_SESSION_IDLE_TIMEOUT", 30*time.Minute, true)
 	if err != nil {
 		return config{}, err
 	}
@@ -184,32 +186,23 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 
-func durationFromEnv(key string, fallback time.Duration) (time.Duration, error) {
-	if value := os.Getenv(key); value != "" {
-		if d, err := time.ParseDuration(value); err == nil {
-			if d <= 0 {
-				return 0, fmt.Errorf("%s must be greater than zero", key)
-			}
-			return d, nil
-		} else {
-			return 0, fmt.Errorf("parse %s: %w", key, err)
-		}
+// durationFromEnv parses a duration environment variable. With allowZero set,
+// zero is accepted and disables the feature the variable controls; otherwise
+// only strictly positive values are valid. Negative values are always rejected.
+func durationFromEnv(key string, fallback time.Duration, allowZero bool) (time.Duration, error) {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback, nil
 	}
-	return fallback, nil
-}
-
-// durationFromEnvAllowZero parses a duration that may be zero. Zero disables
-// the feature it controls; negative values are rejected.
-func durationFromEnvAllowZero(key string, fallback time.Duration) (time.Duration, error) {
-	if value := os.Getenv(key); value != "" {
-		d, err := time.ParseDuration(value)
-		if err != nil {
-			return 0, fmt.Errorf("parse %s: %w", key, err)
-		}
-		if d < 0 {
-			return 0, fmt.Errorf("%s must not be negative", key)
-		}
-		return d, nil
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("parse %s: %w", key, err)
 	}
-	return fallback, nil
+	if d < 0 {
+		return 0, fmt.Errorf("%s must not be negative", key)
+	}
+	if d == 0 && !allowZero {
+		return 0, fmt.Errorf("%s must be greater than zero", key)
+	}
+	return d, nil
 }

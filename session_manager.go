@@ -63,18 +63,17 @@ func (m *sessionManager) getOrCreate(
 		m.mu.Unlock()
 		select {
 		case <-creation.done:
-			m.mu.Lock()
-			if creation.err == nil && m.sessions[id] == creation.session && !processIsDone(creation.session.process) {
-				creation.session.leases++
-			} else if creation.err == nil {
-				creation.err = errors.New("trae ACP process exited while creating session")
-			}
-			session, err := creation.session, creation.err
-			m.mu.Unlock()
-			return session, err
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if creation.err == nil && m.sessions[id] == creation.session && !processIsDone(creation.session.process) {
+			creation.session.leases++
+		} else if creation.err == nil {
+			creation.err = errors.New("trae ACP process exited while creating session")
+		}
+		return creation.session, creation.err
 	}
 	if maxSessions > 0 && len(m.sessions)+len(m.pending) >= maxSessions {
 		m.mu.Unlock()
@@ -85,11 +84,12 @@ func (m *sessionManager) getOrCreate(
 	m.mu.Unlock()
 
 	session, err := create(ctx)
-	if err == nil && session == nil {
-		err = errors.New("session factory returned nil session")
-	}
-	if err == nil && processIsDone(session.process) {
-		err = errors.New("trae ACP process exited while creating session")
+	if err == nil {
+		if session == nil {
+			err = errors.New("session factory returned nil session")
+		} else if processIsDone(session.process) {
+			err = errors.New("trae ACP process exited while creating session")
+		}
 	}
 
 	m.mu.Lock()
@@ -156,12 +156,10 @@ func (m *sessionManager) takeContinuation(prefixFP, newUserFP uint64) (*session,
 	best.mu.Lock()
 	delete(m.sessions, formatFingerprint(best.lastUserFP))
 	best.lastUserFP = newUserFP
-	best.mu.Unlock()
-	m.sessions[formatFingerprint(newUserFP)] = best
 	best.leases++
-	best.mu.Lock()
 	best.touchLocked()
 	best.mu.Unlock()
+	m.sessions[formatFingerprint(newUserFP)] = best
 	return best, nil
 }
 
