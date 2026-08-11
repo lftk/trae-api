@@ -25,6 +25,7 @@ type process struct {
 	workdir          string
 	workdirTemp      bool
 	closeSupported   bool
+	loadSupported    bool
 	done             chan struct{}
 	onDone           []func()
 	doneOnce         sync.Once
@@ -34,6 +35,7 @@ type process struct {
 	boundSession     acp.SessionId
 	sessionCreating  bool
 	newSessionFunc   func(context.Context) (*session, error)
+	loadSessionFunc  func(context.Context, string, string) (*session, error)
 	closeSessionFunc func(context.Context, acp.SessionId) error
 	exitDone         chan struct{}
 	exitOnce         sync.Once
@@ -118,7 +120,8 @@ func startProcess(ctx context.Context, cfg config) (*process, error) {
 		return nil, fmt.Errorf("acp initialize: %w", err)
 	}
 	p.closeSupported = initialized.AgentCapabilities.SessionCapabilities.Close != nil
-	slog.Info("trae ACP process started", "elapsed", time.Since(started), "session_close", p.closeSupported)
+	p.loadSupported = initialized.AgentCapabilities.LoadSession
+	slog.Info("trae ACP process started", "elapsed", time.Since(started), "session_close", p.closeSupported, "session_load", p.loadSupported)
 	return p, nil
 }
 
@@ -184,6 +187,20 @@ func (p *process) notifyDone() {
 }
 
 func (p *process) newSession(ctx context.Context) (*session, error) {
+	return p.createOrLoad(ctx, "", "")
+}
+
+// loadSession resumes a previously persisted ACP session via session/load.
+// cwd must be the session's original working directory (persisted in the
+// mapping); trae-cli validates it against its stored session. The id is the
+// ACP session id to resume.
+func (p *process) loadSession(ctx context.Context, id string, cwd string) (*session, error) {
+	return p.createOrLoad(ctx, id, cwd)
+}
+
+// createOrLoad is the shared binding path for both fresh and resumed
+// sessions. id/cwd are empty for a fresh session.
+func (p *process) createOrLoad(ctx context.Context, id string, cwd string) (*session, error) {
 	p.mu.Lock()
 	if p.boundSession != "" || p.sessionCreating {
 		p.mu.Unlock()
@@ -197,7 +214,7 @@ func (p *process) newSession(ctx context.Context) (*session, error) {
 		p.mu.Unlock()
 	}()
 
-	if p.newSessionFunc != nil {
+	if p.newSessionFunc != nil && id == "" {
 		s, err := p.newSessionFunc(ctx)
 		if err != nil {
 			return nil, err
@@ -214,8 +231,44 @@ func (p *process) newSession(ctx context.Context) (*session, error) {
 		return s, nil
 	}
 
+	if id != "" && p.loadSessionFunc != nil {
+		s, err := p.loadSessionFunc(ctx, id, cwd)
+		if err != nil {
+			return nil, err
+		}
+		if s == nil {
+			return nil, errors.New("session factory returned nil session")
+		}
+		if processIsDone(p) {
+			return nil, errors.New("trae ACP process exited while resuming session")
+		}
+		p.mu.Lock()
+		p.boundSession = s.id
+		p.mu.Unlock()
+		return s, nil
+	}
+
 	if processIsDone(p) {
 		return nil, errors.New("trae ACP process is not running")
+	}
+	if id != "" {
+		if !p.loadSupported {
+			return nil, fmt.Errorf("acp load session: agent does not advertise LoadSession")
+		}
+		resp, err := p.conn.LoadSession(ctx, acp.LoadSessionRequest{Cwd: cwd, McpServers: []acp.McpServer{}, SessionId: acp.SessionId(id)})
+		if err != nil {
+			return nil, fmt.Errorf("acp load session: %w", err)
+		}
+		s := sessionFromLoad(p, acp.SessionId(id), resp)
+		if processIsDone(p) {
+			return nil, errors.New("trae ACP process exited while resuming session")
+		}
+		p.mu.Lock()
+		p.boundSession = s.id
+		p.mu.Unlock()
+		p.client.addSession(s)
+		slog.Info("trae ACP session loaded", "sessionid", s.sessionID())
+		return s, nil
 	}
 	created, err := p.conn.NewSession(ctx, acp.NewSessionRequest{Cwd: p.workdir, McpServers: []acp.McpServer{}})
 	if err != nil {
@@ -234,10 +287,30 @@ func (p *process) newSession(ctx context.Context) (*session, error) {
 }
 
 // sessionFromCreated builds the session object and picks the model selector
-// out of the ACP configuration options offered by trae-cli.
+// out of the ACP configuration options offered by trae-cli for a freshly
+// created session. The current model is left unset so chat()'s setModel
+// falls through to the first advertised model, matching historical behavior.
 func sessionFromCreated(p *process, created acp.NewSessionResponse) *session {
 	s := &session{process: p, id: created.SessionId, lastUsed: time.Now(), updates: make(chan update, updateBufferSize)}
-	for _, option := range created.ConfigOptions {
+	applyModelOptions(s, created.ConfigOptions, false)
+	return s
+}
+
+// sessionFromLoad builds the session object from a resumed ACP session. The
+// currently selected model reported by trae-cli (ConfigOptions <
+// Select.currentValue) is kept so a request without a model field continues
+// using it instead of defaulting to models[0].
+func sessionFromLoad(p *process, id acp.SessionId, resp acp.LoadSessionResponse) *session {
+	s := &session{process: p, id: id, lastUsed: time.Now(), updates: make(chan update, updateBufferSize)}
+	applyModelOptions(s, resp.ConfigOptions, true)
+	return s
+}
+
+// applyModelOptions records the model config selector and its advertised
+// values. When keepCurrent is true (session/load), the agent's reported
+// current selection is preserved as currentModel.
+func applyModelOptions(s *session, options []acp.SessionConfigOption, keepCurrent bool) {
+	for _, option := range options {
 		if option.Select == nil || option.Select.Options.Ungrouped == nil {
 			continue
 		}
@@ -246,16 +319,25 @@ func sessionFromCreated(p *process, created acp.NewSessionResponse) *session {
 			for _, model := range *option.Select.Options.Ungrouped {
 				s.models = append(s.models, string(model.Value))
 			}
+			if keepCurrent {
+				if cv := string(option.Select.CurrentValue); cv != "" {
+					s.currentModel = cv
+				}
+			}
 		}
 	}
-	return s
 }
 
 func (s *session) sessionID() string { return string(s.id) }
 
 func (s *session) setModel(ctx context.Context, model string) (string, error) {
-	if model == "" && len(s.models) > 0 {
-		model = s.models[0]
+	if model == "" {
+		if s.currentModel != "" {
+			return s.currentModel, nil
+		}
+		if len(s.models) > 0 {
+			model = s.models[0]
+		}
 	}
 	if s.currentModel == model {
 		return model, nil
