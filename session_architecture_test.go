@@ -24,7 +24,7 @@ func testProcessFactory() (func(context.Context, config) (*process, error), func
 		var sequence int
 		p.newSessionFunc = func(context.Context) (*session, error) {
 			sequence++
-			s := &session{process: p, session: acp.SessionId(fmt.Sprintf("acp-%d", sequence)), lastUsed: time.Now(), updates: make(chan update, 8)}
+			s := &session{process: p, id: acp.SessionId(fmt.Sprintf("acp-%d", sequence)), lastUsed: time.Now(), updates: make(chan update, 8)}
 			p.client.addSession(s)
 			return s, nil
 		}
@@ -128,12 +128,12 @@ func TestTemporarySessionReleaseClosesSupportedACPSession(t *testing.T) {
 	p.closeSupported = true
 	var closed acp.SessionId
 	p.closeSessionFunc = func(context.Context, acp.SessionId) error {
-		closed = lease.session.session
+		closed = lease.session.id
 		return nil
 	}
 	lease.release()
-	if closed != lease.session.session {
-		t.Fatalf("closed ACP session %q, want %q", closed, lease.session.session)
+	if closed != lease.session.id {
+		t.Fatalf("closed ACP session %q, want %q", closed, lease.session.id)
 	}
 	if len(s.sessions.sessions) != 0 || len(s.sessions.pending) != 0 {
 		t.Fatalf("temporary session was retained: sessions=%d pending=%d", len(s.sessions.sessions), len(s.sessions.pending))
@@ -173,11 +173,11 @@ func TestReapIdleSessionClosesSupportedACPSession(t *testing.T) {
 	p, _ := current()
 	p.closeSupported = true
 	var closed acp.SessionId
-	p.closeSessionFunc = func(context.Context, acp.SessionId) error { closed = session.session; return nil }
+	p.closeSessionFunc = func(context.Context, acp.SessionId) error { closed = session.id; return nil }
 	session.lastUsed = time.Now().Add(-2 * time.Minute)
 	s.reapIdleSessions(time.Now())
-	if closed != session.session {
-		t.Fatalf("closed ACP session %q, want %q", closed, session.session)
+	if closed != session.id {
+		t.Fatalf("closed ACP session %q, want %q", closed, session.id)
 	}
 	if _, ok := s.sessions.sessions[id]; ok {
 		t.Fatal("idle session remained in server map")
@@ -207,8 +207,8 @@ func TestReapIdleSessionDoesNotCloseLeasedSession(t *testing.T) {
 
 func TestTraeClientRoutesUpdatesByACPSessionID(t *testing.T) {
 	c := &client{sessions: make(map[acp.SessionId]*session)}
-	a := &session{session: "a", updates: make(chan update, 1)}
-	b := &session{session: "b", updates: make(chan update, 1)}
+	a := &session{id: "a", updates: make(chan update, 1)}
+	b := &session{id: "b", updates: make(chan update, 1)}
 	c.addSession(a)
 	c.addSession(b)
 
@@ -231,9 +231,9 @@ func TestTraeClientRoutesUpdatesByACPSessionID(t *testing.T) {
 
 func TestTraeClientDropsUpdatesWithoutActivePrompt(t *testing.T) {
 	c := &client{sessions: make(map[acp.SessionId]*session)}
-	s := &session{session: "inactive"}
+	s := &session{id: "inactive"}
 	c.addSession(s)
-	n := acp.SessionNotification{SessionId: s.session, Update: acp.SessionUpdate{
+	n := acp.SessionNotification{SessionId: s.id, Update: acp.SessionUpdate{
 		AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{Content: acp.TextBlock("late")},
 	}}
 	if err := c.SessionUpdate(context.Background(), n); err != nil {

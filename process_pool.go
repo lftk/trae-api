@@ -11,9 +11,11 @@ import (
 
 var errSessionLimit = errors.New("maximum trae ACP session limit reached")
 var errProcessPoolStopped = errors.New("process pool is shutting down")
-var errProcessFactoryNil = errors.New("process factory returned a nil process")
 
-const defaultMaxProcesses = 100
+const (
+	defaultMaxProcesses = 100
+	defaultCloseTimeout = 5 * time.Second
+)
 
 // processPool owns initialized, not-yet-bound ACP processes. A process is
 // removed from the pool when it is assigned to a session and is never reused
@@ -106,11 +108,7 @@ func (p *processPool) fill() {
 }
 
 func (p *processPool) fillDemand() {
-	target := p.cfg.WarmProcesses
-	if target < 1 {
-		target = 1
-	}
-	p.fillTarget(target)
+	p.fillTarget(max(p.cfg.WarmProcesses, 1))
 }
 
 func (p *processPool) fillTarget(target int) {
@@ -137,28 +135,27 @@ func (p *processPool) fillTarget(target int) {
 func (p *processPool) create() {
 	defer p.wg.Done()
 	process, err := p.factory(p.ctx, p.cfg)
-	if err != nil || process == nil || p.isStopping() {
-		if process != nil {
+	if process != nil && err == nil && !p.isStopping() {
+		entry := &pooledProcess{process: process}
+		p.observe(entry)
+		select {
+		case p.ready <- entry:
+		case <-p.stop:
+			p.claim(entry)
 			_ = process.Close()
-		}
-		p.releaseProcessSlot()
-		p.releaseWarmSlot()
-		if err != nil && !errors.Is(err, context.Canceled) && !p.isStopping() {
-			slog.Warn("create trae ACP process failed", "error", err)
-		}
-		if !p.isStopping() {
-			time.AfterFunc(100*time.Millisecond, p.refill)
 		}
 		return
 	}
-
-	entry := &pooledProcess{process: process}
-	p.observe(entry)
-	select {
-	case p.ready <- entry:
-	case <-p.stop:
-		p.claim(entry)
+	if process != nil {
 		_ = process.Close()
+	}
+	p.releaseProcessSlot()
+	p.releaseWarmSlot()
+	if err != nil && !errors.Is(err, context.Canceled) && !p.isStopping() {
+		slog.Warn("create trae ACP process failed", "error", err)
+	}
+	if !p.isStopping() {
+		time.AfterFunc(100*time.Millisecond, p.refill)
 	}
 }
 
@@ -221,7 +218,7 @@ func processIsDone(process *process) bool {
 }
 
 func (p *processPool) close() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultCloseTimeout)
 	defer cancel()
 	p.closeWithContext(ctx)
 }

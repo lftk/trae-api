@@ -22,7 +22,7 @@ type client struct {
 
 func (c *client) addSession(s *session) {
 	c.mu.Lock()
-	c.sessions[s.session] = s
+	c.sessions[s.id] = s
 	c.mu.Unlock()
 }
 func (c *client) removeSession(id acp.SessionId) {
@@ -31,29 +31,35 @@ func (c *client) removeSession(id acp.SessionId) {
 	c.mu.Unlock()
 }
 
+var (
+	errFileAccessUnsupported = errors.New("file access is not supported")
+	errPermissionsDisabled   = errors.New("permission requests are disabled; use --yolo")
+	errTerminalsUnsupported  = errors.New("terminals are not supported")
+)
+
 func (c *client) ReadTextFile(context.Context, acp.ReadTextFileRequest) (acp.ReadTextFileResponse, error) {
-	return acp.ReadTextFileResponse{}, errors.New("file reads are not supported")
+	return acp.ReadTextFileResponse{}, errFileAccessUnsupported
 }
 func (c *client) WriteTextFile(context.Context, acp.WriteTextFileRequest) (acp.WriteTextFileResponse, error) {
-	return acp.WriteTextFileResponse{}, errors.New("file writes are not supported")
+	return acp.WriteTextFileResponse{}, errFileAccessUnsupported
 }
 func (c *client) RequestPermission(context.Context, acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
-	return acp.RequestPermissionResponse{}, errors.New("permission requests are disabled; use --yolo")
+	return acp.RequestPermissionResponse{}, errPermissionsDisabled
 }
 func (c *client) CreateTerminal(context.Context, acp.CreateTerminalRequest) (acp.CreateTerminalResponse, error) {
-	return acp.CreateTerminalResponse{}, errors.New("terminals are not supported")
+	return acp.CreateTerminalResponse{}, errTerminalsUnsupported
 }
 func (c *client) KillTerminal(context.Context, acp.KillTerminalRequest) (acp.KillTerminalResponse, error) {
-	return acp.KillTerminalResponse{}, errors.New("terminals are not supported")
+	return acp.KillTerminalResponse{}, errTerminalsUnsupported
 }
 func (c *client) TerminalOutput(context.Context, acp.TerminalOutputRequest) (acp.TerminalOutputResponse, error) {
-	return acp.TerminalOutputResponse{}, errors.New("terminals are not supported")
+	return acp.TerminalOutputResponse{}, errTerminalsUnsupported
 }
 func (c *client) ReleaseTerminal(context.Context, acp.ReleaseTerminalRequest) (acp.ReleaseTerminalResponse, error) {
-	return acp.ReleaseTerminalResponse{}, errors.New("terminals are not supported")
+	return acp.ReleaseTerminalResponse{}, errTerminalsUnsupported
 }
 func (c *client) WaitForTerminalExit(context.Context, acp.WaitForTerminalExitRequest) (acp.WaitForTerminalExitResponse, error) {
-	return acp.WaitForTerminalExitResponse{}, errors.New("terminals are not supported")
+	return acp.WaitForTerminalExitResponse{}, errTerminalsUnsupported
 }
 
 func (c *client) SessionUpdate(ctx context.Context, n acp.SessionNotification) error {
@@ -69,13 +75,13 @@ func (c *client) SessionUpdate(ctx context.Context, n acp.SessionNotification) e
 	if updates == nil {
 		return nil
 	}
-	if n.Update.AgentMessageChunk != nil && n.Update.AgentMessageChunk.Content.Text != nil {
+	if chunk := n.Update.AgentMessageChunk; chunk != nil && chunk.Content.Text != nil {
 		slog.Debug("ACP agent message chunk", "acp_sessionid", n.SessionId)
-		return c.sendUpdate(ctx, updates, update{Text: n.Update.AgentMessageChunk.Content.Text.Text})
+		return c.sendUpdate(ctx, updates, update{Text: chunk.Content.Text.Text})
 	}
-	if n.Update.AgentThoughtChunk != nil && n.Update.AgentThoughtChunk.Content.Text != nil {
+	if chunk := n.Update.AgentThoughtChunk; chunk != nil && chunk.Content.Text != nil {
 		slog.Debug("ACP agent thought chunk", "acp_sessionid", n.SessionId)
-		return c.sendUpdate(ctx, updates, update{Text: n.Update.AgentThoughtChunk.Content.Text.Text, Reasoning: true})
+		return c.sendUpdate(ctx, updates, update{Text: chunk.Content.Text.Text, Reasoning: true})
 	}
 	return nil
 }
