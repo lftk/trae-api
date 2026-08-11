@@ -25,6 +25,7 @@ type config struct {
 	WarmProcesses       int
 	MaxSessions         int
 	MaxProcesses        int
+	StateDir            string
 }
 
 const defaultWarmProcesses = 4
@@ -102,6 +103,7 @@ func loadConfig() (config, error) {
 		WarmProcesses:       warmProcesses,
 		MaxSessions:         maxSessions,
 		MaxProcesses:        maxProcesses,
+		StateDir:            resolveStateDir(),
 	}
 	if !isLoopbackAddr(cfg.Addr) && cfg.APIToken == "" {
 		if workdirTemp {
