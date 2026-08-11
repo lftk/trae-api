@@ -292,15 +292,16 @@ func (s *server) scanIdleSessions() {
 }
 
 func (s *server) reapIdleSessions(now time.Time) {
-	s.reapManager(now, s.sessions)
+	s.reapManager(now, s.sessions, s.store.deleteRecord)
 	if s.cfg.ImplicitIdleTimeout > 0 {
-		s.reapManager(now, s.implicit)
+		s.reapManager(now, s.implicit, nil)
 	}
 }
 
-func (s *server) reapManager(now time.Time, manager *sessionManager) {
+func (s *server) reapManager(now time.Time, manager *sessionManager, deleteByID func(string)) {
 	manager.mu.Lock()
 	var toClose []*session
+	var idsForStore []string
 	for id, session := range manager.sessions {
 		if session.leases != 0 {
 			continue
@@ -311,9 +312,15 @@ func (s *server) reapManager(now time.Time, manager *sessionManager) {
 		if idle {
 			toClose = append(toClose, session)
 			delete(manager.sessions, id)
+			if deleteByID != nil {
+				idsForStore = append(idsForStore, id)
+			}
 		}
 	}
 	manager.mu.Unlock()
+	for _, id := range idsForStore {
+		deleteByID(id)
+	}
 	for _, session := range toClose {
 		_ = session.Close()
 	}

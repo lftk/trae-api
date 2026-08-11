@@ -67,4 +67,26 @@ func TestLoadConfigProcessLimits(t *testing.T) {
 			t.Fatal("loadConfig succeeded with negative implicit session timeout")
 		}
 	})
+
+	t.Run("state dir explicit empty disables persistence", func(t *testing.T) {
+		t.Setenv("TRAE_API_STATE_DIR", "")
+		cfg, err := loadConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.StateDir != "" {
+			t.Fatalf("StateDir = %q, want empty when explicitly disabled", cfg.StateDir)
+		}
+	})
+
+	t.Run("state dir explicit value honored", func(t *testing.T) {
+		t.Setenv("TRAE_API_STATE_DIR", "/custom/state-dir")
+		cfg, err := loadConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.StateDir != "/custom/state-dir" {
+			t.Fatalf("StateDir = %q, want /custom/state-dir", cfg.StateDir)
+		}
+	})
 }
