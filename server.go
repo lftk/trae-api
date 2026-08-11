@@ -17,6 +17,7 @@ type server struct {
 	cfg         config
 	sessions    *sessionManager
 	implicit    *sessionManager
+	store       *sessionStore
 	processPool *processPool
 	newProcess  func(context.Context, config) (*process, error)
 	stopScan    chan struct{}
@@ -41,9 +42,11 @@ func newServer(cfg config) *server {
 		cfg:      cfg,
 		sessions: newSessionManager(cfg.SessionIdleTimeout),
 		implicit: newSessionManager(cfg.ImplicitIdleTimeout),
+		store:    newSessionStore(cfg.StateDir, cfg.SessionIdleTimeout),
 		stopScan: make(chan struct{}),
 		scanDone: make(chan struct{}),
 	}
+	s.store.pruneExpired(time.Now())
 	s.newProcess = startProcess
 	// The pool resolves the factory through the field so tests can swap in a
 	// fake process factory after construction.
@@ -64,7 +67,7 @@ func (s *server) acquireSession(ctx context.Context, id string) (*sessionLease, 
 		// through acquireImplicitSession. This branch only serves the
 		// disabled configuration and keeps the historical behavior of
 		// closing the temporary session as soon as the request ends.
-		session, err := s.createSession(ctx)
+		session, err := s.createSession(ctx, "")
 		if err != nil {
 			return nil, err
 		}
@@ -80,7 +83,9 @@ func (s *server) acquireSession(ctx context.Context, id string) (*sessionLease, 
 			},
 		}, nil
 	}
-	session, err := s.sessions.getOrCreate(ctx, id, s.cfg.MaxSessions, s.createSession, s.handleSessionDeath)
+	session, err := s.sessions.getOrCreate(ctx, id, s.cfg.MaxSessions, func(ctx context.Context) (*session, error) {
+		return s.createSession(ctx, id)
+	}, s.handleSessionDeath)
 	if err != nil {
 		return nil, err
 	}
@@ -125,7 +130,7 @@ func (s *server) createImplicitSession(ctx context.Context, key string) (*sessio
 	if s.cfg.MaxSessions > 0 && s.implicit.count() >= s.cfg.MaxSessions {
 		return nil, errSessionLimit
 	}
-	sess, err := s.createSession(ctx)
+	sess, err := s.createSession(ctx, "")
 	if err != nil {
 		return nil, err
 	}
@@ -163,15 +168,43 @@ func implicitLease(session *session, manager *sessionManager) *sessionLease {
 	}
 }
 
-func (s *server) createSession(ctx context.Context) (*session, error) {
+// createSession acquires a process and either resumes a persisted ACP session
+// (calling trae-cli's session/load) or creates a fresh one. For non-empty
+// externalID it persists (or overwrites) the external-ID -> ACP session mapping
+// so the session can be resumed after a restart. Stores are best-effort: a
+// failure to read or resume a mapping degrades to a fresh session.
+func (s *server) createSession(ctx context.Context, externalID string) (*session, error) {
 	p, err := s.processPool.acquire(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if externalID != "" && p.loadSupported {
+		if rec, _ := s.store.loadRecord(externalID); rec != nil {
+			if session, err := p.loadSession(ctx, rec.AcpSessionID, rec.Cwd); err == nil {
+				return session, nil
+			} else {
+				slog.Warn("resume ACP session failed; recreating", "external_id", externalID, "acpsessionid", rec.AcpSessionID, "error", err)
+				s.store.deleteRecord(externalID)
+			}
+		}
 	}
 	session, err := p.newSession(ctx)
 	if err != nil {
 		_ = p.Close()
 		return nil, err
+	}
+	if externalID != "" {
+		now := time.Now()
+		if err := s.store.storeRecord(&sessionRecord{
+			ExternalID:   externalID,
+			AcpSessionID: session.sessionID(),
+			Cwd:          p.workdir,
+			Model:        session.currentModel,
+			CreatedAt:    now,
+			LastUsedAt:   now,
+		}); err != nil {
+			slog.Warn("persist session mapping", "external_id", externalID, "error", err)
+		}
 	}
 	return session, nil
 }
@@ -259,15 +292,16 @@ func (s *server) scanIdleSessions() {
 }
 
 func (s *server) reapIdleSessions(now time.Time) {
-	s.reapManager(now, s.sessions)
+	s.reapManager(now, s.sessions, s.store.deleteRecord)
 	if s.cfg.ImplicitIdleTimeout > 0 {
-		s.reapManager(now, s.implicit)
+		s.reapManager(now, s.implicit, nil)
 	}
 }
 
-func (s *server) reapManager(now time.Time, manager *sessionManager) {
+func (s *server) reapManager(now time.Time, manager *sessionManager, deleteByID func(string)) {
 	manager.mu.Lock()
 	var toClose []*session
+	var idsForStore []string
 	for id, session := range manager.sessions {
 		if session.leases != 0 {
 			continue
@@ -278,9 +312,15 @@ func (s *server) reapManager(now time.Time, manager *sessionManager) {
 		if idle {
 			toClose = append(toClose, session)
 			delete(manager.sessions, id)
+			if deleteByID != nil {
+				idsForStore = append(idsForStore, id)
+			}
 		}
 	}
 	manager.mu.Unlock()
+	for _, id := range idsForStore {
+		deleteByID(id)
+	}
 	for _, session := range toClose {
 		_ = session.Close()
 	}

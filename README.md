@@ -32,6 +32,7 @@ trae-api
 | `TRAE_API_DEBUG` | `false` | 是否输出请求、响应和 ACP 调试日志 |
 | `TRAE_API_SESSION_IDLE_TIMEOUT` | `720h` | session 空闲过期时间 |
 | `TRAE_API_IMPLICIT_SESSION_IDLE_TIMEOUT` | `30m` | 无 session ID 请求的隐式会话空闲过期时间，设为 `0` 禁用隐式会话 |
+| `TRAE_API_STATE_DIR` | `$XDG_STATE_HOME/trae-api`（无則 `~/.local/state/trae-api`） | 状态目录，持久化显式会话 → ACP session 的映射以支持重启恢复；显式置空 `TRAE_API_STATE_DIR=` 关闭持久化 |
 | `TRAE_API_SESSION_SCAN_INTERVAL` | `1m` | session 过期扫描间隔 |
 | `TRAE_API_WARM_PROCESSES` | `4` | 后台预热的空闲 ACP 进程数，设为 `0` 表示不启动预热 |
 | `TRAE_API_MAX_SESSIONS` | `100` | 稳定 session 数量上限 |
@@ -75,12 +76,11 @@ curl http://127.0.0.1:8723/v1/chat/completions \
 进程，prompt 完成或请求结束后会销毁该 session 及进程。服务只使用当前配置的一个
 工作目录。
 
-显式 session 当前仅存储在内存中，默认连续空闲 30 天后过期。若 ACP 声明支持
+显式 session 的外部 ID 与 ACP session 的对应关系持久化在 `TRAE_API_STATE_DIR`（默认开启）下，使服务重启后客户端可用同一 `X-Session-ID` 续聊：首个请求会通过 trae-cli 声明的 `session/load` 能力恢复其磁盘会话（自动还原对话历史、所选模型与权限模式），不需要重放或补一次额外的模型调用。若 trae-cli 不支持 `session/load`、或磁盘上原 ACP 会话已失效（例如被清理），则降级为新建会话并重写映射。默认连续空闲 30 天后过期，过期会同时割除内存与磁盘映射。若 ACP 声明支持
 `session/close`，过期 session 会向 ACP 发送关闭请求。匿名请求使用完整的
 `messages`，prompt 完成后立即从 client 的 ACP session 路由表中释放临时 session。
 某个 session 的 ACP 进程崩溃只会使该 session 失效，下一次请求会重新懒启动该
-session 的进程；正在进行的请求会收到 upstream/ACP 错误。服务重启后需要重新建立
-session。
+session 的进程（磁盘映射仍在，优先尝试 load 恢复）；正在进行的请求会收到 upstream/ACP 错误。
 
 无 session ID 的请求应在每次请求中携带完整消息历史。显式 session ID 的首次请求
 可以携带初始上下文，后续请求只需携带新增消息，历史由 ACP session 保存。服务端

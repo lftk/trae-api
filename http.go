@@ -105,6 +105,7 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 		Usage: openAIUsage(usage, sentPrompt, answer, reasoning),
 	}
 	writeJSONOrLog(w, http.StatusOK, response)
+	updateLastUsed(s, externalID, session.lastUsed)
 	slog.Debug("chat response", "completionid", completionID, "external_sessionid", externalID, "acp_sessionid", session.sessionID(), "usage", response.Usage)
 	slog.Info("chat completed", "completionid", completionID, "sessionid", externalID, "acpsessionid", session.sessionID(), "implicit", lease.implicit, "continued", continued, "elapsed", time.Since(started))
 }
@@ -216,6 +217,7 @@ func (s *server) streamChat(
 		})
 	} else {
 		recordImplicitFingerprints(lease, requestMessages, answer)
+		updateLastUsed(s, externalID, session.lastUsed)
 		if usage == nil {
 			w.Header().Set("X-Usage-Estimated", "true")
 		}
@@ -273,6 +275,20 @@ func recordImplicitFingerprints(lease *sessionLease, requestMessages []openai.Ch
 	full = append(full, requestMessages...)
 	full = append(full, assistant)
 	lease.session.recordFingerprints(fingerprintMessages(requestMessages), fingerprintMessages(full))
+}
+
+// updateLastUsed persists the refreshed last-used timestamp for a stable
+// session's mapping (so the idle GC at the next startup can evict it
+// correctly). It is a no-op for anonymous/implicit requests (externalID == "")
+// and disabled stores. Caller may hold session.mu; the store has its own
+// concerns and never touches session.mu. Best-effort: failures are logged.
+func updateLastUsed(s *server, externalID string, lastUsed time.Time) {
+	if externalID == "" {
+		return
+	}
+	if err := s.store.touchLastUsed(externalID, lastUsed); err != nil {
+		slog.Warn("persist session last_used", "sessionid", externalID, "error", err)
+	}
 }
 
 func debugHeaders(headers http.Header) map[string][]string {
