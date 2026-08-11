@@ -38,14 +38,14 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	slog.Info(
+		"trae-api listening",
+		"addr", cfg.Addr,
+		"trae", cfg.TraeBin,
+		"args", acpArgs(cfg.Yolo),
+	)
 	serverErr := make(chan error, 1)
 	go func() {
-		slog.Info(
-			"trae-api listening",
-			"addr", cfg.Addr,
-			"trae", cfg.TraeBin,
-			"args", acpArgs(cfg.Yolo),
-		)
 		serverErr <- server.ListenAndServe()
 	}()
 

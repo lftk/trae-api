@@ -39,6 +39,8 @@ type process struct {
 	exitOnce         sync.Once
 }
 
+const updateBufferSize = 128
+
 // session is deliberately only session-scoped state. The HTTP session ID
 // is mapped to this object by server; ACP notifications use session instead.
 type session struct {
@@ -234,7 +236,7 @@ func (p *process) newSession(ctx context.Context) (*session, error) {
 // sessionFromCreated builds the session object and picks the model selector
 // out of the ACP configuration options offered by trae-cli.
 func sessionFromCreated(p *process, created acp.NewSessionResponse) *session {
-	s := &session{process: p, id: created.SessionId, lastUsed: time.Now(), updates: make(chan update, 128)}
+	s := &session{process: p, id: created.SessionId, lastUsed: time.Now(), updates: make(chan update, updateBufferSize)}
 	for _, option := range created.ConfigOptions {
 		if option.Select == nil || option.Select.Options.Ungrouped == nil {
 			continue
@@ -284,7 +286,7 @@ func (s *session) prompt(ctx context.Context, text string, stream func(update)) 
 	defer s.promptMu.Unlock()
 	s.lastUsed = time.Now()
 	text = s.preparePrompt(text)
-	updates := make(chan update, 128)
+	updates := make(chan update, updateBufferSize)
 	s.updatesMu.Lock()
 	s.updates = updates
 	s.updatesMu.Unlock()
@@ -359,7 +361,7 @@ func (s *session) recordFingerprints(userFP, fullFP uint64) {
 }
 
 func (s *session) Close() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultCloseTimeout)
 	defer cancel()
 	return s.closeWithContext(ctx)
 }
@@ -406,7 +408,7 @@ func (p *process) closeSession(ctx context.Context, id acp.SessionId) error {
 }
 
 func (p *process) Close() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultCloseTimeout)
 	defer cancel()
 	return p.closeWithContext(ctx)
 }

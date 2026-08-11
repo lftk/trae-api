@@ -11,9 +11,11 @@ import (
 
 var errSessionLimit = errors.New("maximum trae ACP session limit reached")
 var errProcessPoolStopped = errors.New("process pool is shutting down")
-var errProcessFactoryNil = errors.New("process factory returned a nil process")
 
-const defaultMaxProcesses = 100
+const (
+	defaultMaxProcesses = 100
+	defaultCloseTimeout = 5 * time.Second
+)
 
 // processPool owns initialized, not-yet-bound ACP processes. A process is
 // removed from the pool when it is assigned to a session and is never reused
@@ -106,11 +108,7 @@ func (p *processPool) fill() {
 }
 
 func (p *processPool) fillDemand() {
-	target := p.cfg.WarmProcesses
-	if target < 1 {
-		target = 1
-	}
-	p.fillTarget(target)
+	p.fillTarget(max(p.cfg.WarmProcesses, 1))
 }
 
 func (p *processPool) fillTarget(target int) {
@@ -220,7 +218,7 @@ func processIsDone(process *process) bool {
 }
 
 func (p *processPool) close() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultCloseTimeout)
 	defer cancel()
 	p.closeWithContext(ctx)
 }

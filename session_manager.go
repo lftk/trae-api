@@ -174,18 +174,21 @@ func (m *sessionManager) releaseBySession(session *session) {
 		return
 	}
 	session.leases--
-	orphaned := session.leases == 0
-	if orphaned {
-		for _, s := range m.sessions {
-			if s == session {
-				orphaned = false
-				break
-			}
-		}
-	}
+	orphaned := session.leases == 0 && !m.containsLocked(session)
 	m.mu.Unlock()
 	if orphaned {
 		slog.Info("close replaced implicit session after lease drained", "acpsessionid", session.sessionID())
 		_ = session.Close()
 	}
+}
+
+// containsLocked reports whether the manager still tracks the session.
+// Caller must hold m.mu.
+func (m *sessionManager) containsLocked(session *session) bool {
+	for _, s := range m.sessions {
+		if s == session {
+			return true
+		}
+	}
+	return false
 }

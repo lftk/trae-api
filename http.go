@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -19,28 +20,13 @@ import (
 const (
 	legacySessionIDHeader     = "X-Session-ID"
 	claudeCodeSessionIDHeader = "X-Claude-Code-Session-Id"
+	maxRequestBody            = 1 << 20
 )
 
 func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	var req openai.ChatCompletionRequest
-	decoder := json.NewDecoder(r.Body)
-	if err := decoder.Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid chat completion request: "+err.Error())
-		return
-	}
-	var extra any
-	if err := decoder.Decode(&extra); err != io.EOF {
-		writeError(w, http.StatusBadRequest, "invalid chat completion request: multiple JSON values")
-		return
-	}
-	if len(req.Messages) == 0 {
-		writeError(w, http.StatusBadRequest, "invalid chat completion request: messages is required")
-		return
-	}
-	if err := validateMessages(req.Messages); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid chat completion request: "+err.Error())
+	req, ok := decodeChatRequest(w, r)
+	if !ok {
 		return
 	}
 	externalID := requestSessionID(r)
@@ -121,6 +107,36 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 	writeJSONOrLog(w, http.StatusOK, response)
 	slog.Debug("chat response", "completionid", completionID, "external_sessionid", externalID, "acp_sessionid", session.sessionID(), "usage", response.Usage)
 	slog.Info("chat completed", "completionid", completionID, "sessionid", externalID, "acpsessionid", session.sessionID(), "implicit", lease.implicit, "continued", continued, "elapsed", time.Since(started))
+}
+
+// decodeChatRequest parses and validates the chat completion body, writing
+// the error response and returning false when the request is malformed.
+func decodeChatRequest(w http.ResponseWriter, r *http.Request) (openai.ChatCompletionRequest, bool) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+	var req openai.ChatCompletionRequest
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&req); err != nil {
+		writeBadRequest(w, err.Error())
+		return req, false
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		writeBadRequest(w, "multiple JSON values")
+		return req, false
+	}
+	if len(req.Messages) == 0 {
+		writeBadRequest(w, "messages is required")
+		return req, false
+	}
+	if err := validateMessages(req.Messages); err != nil {
+		writeBadRequest(w, err.Error())
+		return req, false
+	}
+	return req, true
+}
+
+func writeBadRequest(w http.ResponseWriter, detail string) {
+	writeError(w, http.StatusBadRequest, "invalid chat completion request: "+detail)
 }
 
 func requestSessionID(r *http.Request) string {
@@ -269,7 +285,7 @@ func debugHeaders(headers http.Header) map[string][]string {
 			result[name] = []string{"<redacted>"}
 			continue
 		}
-		result[name] = append([]string(nil), values...)
+		result[name] = slices.Clone(values)
 	}
 	return result
 }

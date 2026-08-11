@@ -45,6 +45,8 @@ func newServer(cfg config) *server {
 		scanDone: make(chan struct{}),
 	}
 	s.newProcess = startProcess
+	// The pool resolves the factory through the field so tests can swap in a
+	// fake process factory after construction.
 	s.processPool = newProcessPool(cfg, func(ctx context.Context, cfg config) (*process, error) {
 		return s.newProcess(ctx, cfg)
 	})
@@ -292,7 +294,7 @@ func (s *server) shutdown() {
 
 func (s *server) shutdownTimeout() time.Duration {
 	if s.cfg.ShutdownTimeout <= 0 {
-		return 5 * time.Second
+		return defaultCloseTimeout
 	}
 	return s.cfg.ShutdownTimeout
 }
