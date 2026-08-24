@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -54,9 +55,15 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 	}
 	defer lease.release()
 	session := lease.session
+	// The session mutex is deliberately held only around the model selection,
+	// the fingerprint bookkeeping and the last-used read. It is not held across
+	// the ACP prompt itself: promptMu already serializes prompts per session, the
+	// lease keeps the reaper and replacement paths away, and holding the mutex
+	// for a multi-minute agent run would stall unrelated bookkeeping on the same
+	// session (acquire touch, continuation scans, disk persistence).
 	session.mu.Lock()
-	defer session.mu.Unlock()
 	selectedModel, err := session.setModel(r.Context(), req.Model)
+	session.mu.Unlock()
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -81,7 +88,12 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	session.mu.Lock()
 	recordImplicitFingerprints(lease, req.Messages, answer)
+	lastUsed := session.lastUsed
+	model := session.currentModel
+	session.mu.Unlock()
+	updateLastUsed(s, externalID, lastUsed, model)
 	if usage == nil {
 		w.Header().Set("X-Usage-Estimated", "true")
 	}
@@ -105,7 +117,6 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 		Usage: openAIUsage(usage, sentPrompt, answer, reasoning),
 	}
 	writeJSONOrLog(w, http.StatusOK, response)
-	updateLastUsed(s, externalID, session.lastUsed)
 	slog.Debug("chat response", "completionid", completionID, "external_sessionid", externalID, "acp_sessionid", session.sessionID(), "usage", response.Usage)
 	slog.Info("chat completed", "completionid", completionID, "sessionid", externalID, "acpsessionid", session.sessionID(), "implicit", lease.implicit, "continued", continued, "elapsed", time.Since(started))
 }
@@ -216,11 +227,15 @@ func (s *server) streamChat(
 			},
 		})
 	} else {
+		session.mu.Lock()
 		recordImplicitFingerprints(lease, requestMessages, answer)
-		updateLastUsed(s, externalID, session.lastUsed)
-		if usage == nil {
-			w.Header().Set("X-Usage-Estimated", "true")
-		}
+		lastUsed := session.lastUsed
+		model := session.currentModel
+		session.mu.Unlock()
+		updateLastUsed(s, externalID, lastUsed, model)
+		// X-Usage-Estimated is intentionally not set here: once the first SSE
+		// chunk is flushed the response headers are already committed. Stream
+		// clients still learn about the estimate from the final chunk's Usage.
 		// If ACP supplied only thought chunks, prompt() converts them to the
 		// answer after the stream callback has already run. Send that fallback
 		// answer now so a proxy/client does not finish with an empty response.
@@ -277,16 +292,17 @@ func recordImplicitFingerprints(lease *sessionLease, requestMessages []openai.Ch
 	lease.session.recordFingerprints(fingerprintMessages(requestMessages), fingerprintMessages(full))
 }
 
-// updateLastUsed persists the refreshed last-used timestamp for a stable
-// session's mapping (so the idle GC at the next startup can evict it
-// correctly). It is a no-op for anonymous/implicit requests (externalID == "")
-// and disabled stores. Caller may hold session.mu; the store has its own
-// concerns and never touches session.mu. Best-effort: failures are logged.
-func updateLastUsed(s *server, externalID string, lastUsed time.Time) {
+// updateLastUsed persists the refreshed last-used timestamp (and current model)
+// for a stable session's mapping, so the idle GC at the next startup evicts it
+// correctly and the on-disk record reflects the active model. It is a no-op for
+// anonymous/implicit requests (externalID == "") and disabled stores. Caller may
+// hold session.mu; the store has its own concerns and never touches session.mu.
+// Best-effort: failures are logged.
+func updateLastUsed(s *server, externalID string, lastUsed time.Time, model string) {
 	if externalID == "" {
 		return
 	}
-	if err := s.store.touchLastUsed(externalID, lastUsed); err != nil {
+	if err := s.store.touchLastUsed(externalID, lastUsed, model); err != nil {
 		slog.Warn("persist session last_used", "sessionid", externalID, "error", err)
 	}
 }
@@ -351,7 +367,10 @@ func estimateTokens(text string) int {
 	for _, r := range text {
 		switch {
 		case unicode.IsSpace(r):
-			inWord = false
+			if inWord {
+				count++
+				inWord = false
+			}
 		case unicode.Is(unicode.Han, r) || unicode.IsPunct(r) || unicode.IsSymbol(r):
 			if inWord {
 				count++
@@ -384,12 +403,23 @@ func (s *server) routes() http.Handler {
 
 func authMiddleware(token string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if token != "" && r.Header.Get("Authorization") != "Bearer "+token {
+		if token != "" && !validBearer(r.Header.Get("Authorization"), token) {
 			writeError(w, http.StatusUnauthorized, "invalid bearer token")
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// validBearer reports whether the Authorization header carries the expected
+// token as a Bearer credential. The comparison is constant-time to avoid a
+// timing side channel on the token.
+func validBearer(header, token string) bool {
+	scheme, rest, ok := strings.Cut(header, " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(strings.TrimSpace(rest)), []byte(token)) == 1
 }
 
 func writeSSE(w io.Writer, value any) error {

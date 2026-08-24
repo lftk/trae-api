@@ -148,9 +148,10 @@ func (s *sessionStore) deleteRecord(externalID string) {
 	}
 }
 
-// touchLastUsed refreshes LastUsedAt on an existing record. Missing records are
-// tolerated (a fresh session that never completed a turn has no mapping yet).
-func (s *sessionStore) touchLastUsed(externalID string, lastUsed time.Time) error {
+// touchLastUsed refreshes LastUsedAt (and, when non-empty, the active model)
+// on an existing record. Missing records are tolerated (a fresh session that
+// never completed a turn has no mapping yet).
+func (s *sessionStore) touchLastUsed(externalID string, lastUsed time.Time, model string) error {
 	if !s.enabled() {
 		return nil
 	}
@@ -162,6 +163,9 @@ func (s *sessionStore) touchLastUsed(externalID string, lastUsed time.Time) erro
 		return nil
 	}
 	rec.LastUsedAt = lastUsed
+	if model != "" {
+		rec.Model = model
+	}
 	return s.storeRecord(rec)
 }
 

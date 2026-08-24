@@ -231,6 +231,8 @@ func (s *server) models(w http.ResponseWriter, r *http.Request) {
 	models, err := s.listModels(r.Context())
 	if err != nil {
 		slog.Warn("list trae models", "error", err)
+		writeError(w, http.StatusBadGateway, "list trae models: "+err.Error())
+		return
 	}
 	data := make([]openai.Model, 0, len(models))
 	for _, model := range models {

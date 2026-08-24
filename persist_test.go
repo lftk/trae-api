@@ -26,7 +26,7 @@ func TestSessionStoreDisabledNoOps(t *testing.T) {
 		t.Fatalf("store on disabled store: err=%v", err)
 	}
 	s.deleteRecord("any")
-	if err := s.touchLastUsed("any", time.Now()); err != nil {
+	if err := s.touchLastUsed("any", time.Now(), ""); err != nil {
 		t.Fatalf("touch on disabled store: err=%v", err)
 	}
 	s.pruneExpired(time.Now())
@@ -87,7 +87,7 @@ func TestSessionStoreTouchLastUsed(t *testing.T) {
 	old := time.Now().Add(-30 * time.Minute)
 	_ = s.storeRecord(&sessionRecord{ExternalID: "x", AcpSessionID: "u", Cwd: "/", CreatedAt: old, LastUsedAt: old})
 	fresh := time.Now()
-	if err := s.touchLastUsed("x", fresh); err != nil {
+	if err := s.touchLastUsed("x", fresh, ""); err != nil {
 		t.Fatal(err)
 	}
 	rec, _ := s.loadRecord("x")
@@ -99,9 +99,30 @@ func TestSessionStoreTouchLastUsed(t *testing.T) {
 	}
 }
 
+func TestSessionStoreTouchPersistsModel(t *testing.T) {
+	s := newTestSessionStore(t, time.Hour)
+	old := time.Now().Add(-30 * time.Minute)
+	_ = s.storeRecord(&sessionRecord{ExternalID: "x", AcpSessionID: "u", Cwd: "/", CreatedAt: old, LastUsedAt: old})
+	if err := s.touchLastUsed("x", time.Now(), "GLM-5"); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := s.loadRecord("x")
+	if rec.Model != "GLM-5" {
+		t.Fatalf("model = %q, want GLM-5", rec.Model)
+	}
+	// an empty model must not erase the previously recorded one
+	if err := s.touchLastUsed("x", time.Now(), ""); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ = s.loadRecord("x")
+	if rec.Model != "GLM-5" {
+		t.Fatalf("model was erased by empty touch: %q", rec.Model)
+	}
+}
+
 func TestSessionStoreTouchMissingIsTolerated(t *testing.T) {
 	s := newTestSessionStore(t, time.Hour)
-	if err := s.touchLastUsed("nope", time.Now()); err != nil {
+	if err := s.touchLastUsed("nope", time.Now(), ""); err != nil {
 		t.Fatalf("touch missing record should not error: %v", err)
 	}
 }

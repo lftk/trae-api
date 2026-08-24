@@ -91,15 +91,18 @@ func TestUpdateLastUsedPersistsStableSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	fresh := time.Now()
-	updateLastUsed(s, "client-1", fresh)
+	updateLastUsed(s, "client-1", fresh, "GLM-5")
 	rec, _ := s.store.loadRecord("client-1")
 	if rec == nil || !rec.LastUsedAt.Equal(fresh) {
 		t.Fatalf("last_used_at not persisted: %+v", rec)
 	}
+	if rec.Model != "GLM-5" {
+		t.Fatalf("model not persisted: %+v", rec)
+	}
 
 	// anonymous touch is a no-op (no file created)
 	before, _ := s.store.loadRecord("absent")
-	updateLastUsed(s, "absent", time.Now())
+	updateLastUsed(s, "absent", time.Now(), "")
 	after, _ := s.store.loadRecord("absent")
 	if before != nil || after != nil {
 		t.Fatal("updateLastUsed created a record for an anonymous session")
@@ -116,7 +119,7 @@ func TestDisabledStoreReapIsNoOp(t *testing.T) {
 	s.sessions.sessions["client-1"] = sess
 	s.sessions.mu.Unlock()
 	s.reapIdleSessions(time.Now())
-	updateLastUsed(s, "anything", time.Now())
+	updateLastUsed(s, "anything", time.Now(), "")
 	if _, ok := s.sessions.sessions["client-1"]; ok {
 		t.Fatal("reap did not run with disabled store")
 	}
