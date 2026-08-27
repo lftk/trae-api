@@ -1,10 +1,15 @@
 # trae-api
 
-将 `trae-cli acp serve` 包装为 OpenAI 兼容的 HTTP 服务。
+将 `trae-cli acp serve` 包装为 OpenAI 兼容的 HTTP 服务，让任何 OpenAI 客户端（VS Code Chat、Claude Code、自写脚本等）都能使用 Trae CLI 作为后端模型。
 
 ## 安装
 
-要求 Go 1.23 及以上，并已安装、登录 `trae-cli`：
+前置要求：
+
+1. 安装并**登录** `trae-cli`（登录一次即可，服务本身不处理认证）。安装方式见 [Trae CLI 官方文档](https://docs.trae.cn/cli)；首次运行 `trae-cli` 任意命令会引导完成登录。
+2. Go 1.23 及以上。
+
+安装服务：
 
 ```bash
 go install github.com/lftk/trae-api@latest
@@ -12,77 +17,51 @@ go install github.com/lftk/trae-api@latest
 
 ## 使用
 
-启动服务：
+启动服务（默认监听 `127.0.0.1:8723`）：
 
 ```bash
 trae-api
 ```
 
-默认监听 `127.0.0.1:8723`。
-
-常用配置：
-
-| 环境变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `TRAE_API_ADDR` | `127.0.0.1:8723` | 监听地址 |
-| `TRAE_API_WORKDIR` | 临时目录 | 项目目录 |
-| `TRAE_API_TOKEN` | 空 | 非本机监听时必填 |
-| `TRAE_API_BIN` | `trae-cli` | CLI 可执行文件 |
-| `TRAE_API_YOLO` | `true` | 是否以 `--yolo` 启动 ACP |
-| `TRAE_API_DEBUG` | `false` | 是否输出请求、响应和 ACP 调试日志 |
-| `TRAE_API_SESSION_IDLE_TIMEOUT` | `720h` | session 空闲过期时间 |
-| `TRAE_API_IMPLICIT_SESSION_IDLE_TIMEOUT` | `30m` | 无 session ID 请求的隐式会话空闲过期时间，设为 `0` 禁用隐式会话 |
-| `TRAE_API_STATE_DIR` | `$XDG_STATE_HOME/trae-api`（无則 `~/.local/state/trae-api`） | 状态目录，持久化显式会话 → ACP session 的映射以支持重启恢复；显式置空 `TRAE_API_STATE_DIR=` 关闭持久化 |
-| `TRAE_API_SESSION_SCAN_INTERVAL` | `1m` | session 过期扫描间隔 |
-| `TRAE_API_WARM_PROCESSES` | `4` | 后台预热的空闲 ACP 进程数，设为 `0` 表示不启动预热 |
-| `TRAE_API_MAX_SESSIONS` | `100` | 稳定 session 数量上限 |
-| `TRAE_API_MAX_PROCESSES` | `100` | trae-cli ACP 进程总数上限 |
-
-未设置 `TRAE_API_WORKDIR` 时，服务创建的临时目录仅是 ACP 所需的隔离占位工作区，
-并不代表调用方的真实项目。每个 ACP session 的首次 prompt 会自动加入工作区声明，
-要求代理不要从该目录推断项目结构或操作其中的文件，而只使用对话中提供的上下文。
-如果任务需要访问真实项目文件，仍须在启动服务时显式设置 `TRAE_API_WORKDIR`。
-
-## API
+然后像使用任何 OpenAI 兼容服务一样调用：
 
 ```bash
+# 查看可用模型
 curl http://127.0.0.1:8723/v1/models
 
+# 发起对话（文本消息、流式响应都支持）
 curl http://127.0.0.1:8723/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"","messages":[{"role":"user","content":"请简单介绍一下你自己"}]}'
 ```
 
-支持：
+其他入口：
 
-- `GET /healthz`（返回 `sessions` 与 `implicit_sessions` 数量，便于观察会话复用）
-- `GET /v1/models`
-- `POST /v1/chat/completions`
-- 文本消息和流式响应（`"stream": true`）
-- 使用请求头 `X-Session-ID` 复用会话；匿名请求不会自动返回可复用的 session ID
-- Claude Code 可直接使用其 `X-Claude-Code-Session-Id` 请求头复用会话（Claude Code 2.1.86+）
-- 无 session ID 的请求（如 VS Code Chat）通过消息历史指纹自动识别会话延续：请求的消息前缀与某个隐式会话的已记录 transcript 一致时，复用该会话的 ACP 进程，只发送新增消息；重放相同请求、编辑历史或新对话则创建新会话并携带完整消息历史。进行中的隐式会话不会被共享：相同指纹的并发请求（如两个客户端出现相同对话）各自获得独立会话，被替换的会话在请求结束后关闭。隐式会话在 `TRAE_API_IMPLICIT_SESSION_IDLE_TIMEOUT`（默认 30 分钟）空闲后回收，设为 `0` 恢复“每次请求创建并立即销毁临时会话”的旧行为
+- `GET /healthz`：健康检查
+- `POST /v1/chat/completions`，`"stream": true` 时返回流式响应
+- 请求头 `X-Session-ID`：复用会话，续聊时只需发送新增消息；Claude Code 可直接使用其 `X-Claude-Code-Session-Id` 头复用会话
+- 无 session ID 的请求（如 VS Code Chat）需每次携带完整消息历史，服务会自动识别并复用对应会话
 
-当前不支持图片等结构化消息。默认启动参数包含 `--yolo`，仅建议在受信任的本机项目目录中使用。
+### 配置
 
-每个逻辑 session 都独占一个 `trae-cli acp serve` 进程。服务启动后会在后台预热
-`TRAE_API_WARM_PROCESSES` 个已完成 ACP 初始化的空闲进程；稳定 session 优先领取
-预热进程，领取后由后台补充池容量。设置为 `0` 时不启动预热，但首次请求会触发后台
-创建。进程总数受 `TRAE_API_MAX_PROCESSES` 限制，达到上限时新的请求会等待已有进程结束；稳定 session 数量仍受
-`TRAE_API_MAX_SESSIONS` 限制。稳定的
-`X-Session-ID` 或 `X-Claude-Code-Session-Id` 会复用对应的 ACP session 和进程，
-不同 session 可以并发执行 prompt。首次请求需要承担进程启动和 ACP 初始化耗时；
-后续请求不会重复启动进程。没有稳定标识的请求每次创建请求级临时 ACP session 和
-进程，prompt 完成或请求结束后会销毁该 session 及进程。服务只使用当前配置的一个
-工作目录。
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `TRAE_API_ADDR` | `127.0.0.1:8723` | 监听地址 |
+| `TRAE_API_WORKDIR` | 临时目录 | 项目目录，访问真实项目文件时必须设置 |
+| `TRAE_API_TOKEN` | 空 | 非本机监听时必填 |
+| `TRAE_API_BIN` | `trae-cli` | CLI 可执行文件路径 |
+| `TRAE_API_YOLO` | `true` | 是否以 `--yolo` 启动 ACP |
+| `TRAE_API_DEBUG` | `false` | 输出请求、响应和 ACP 调试日志 |
+| `TRAE_API_SESSION_IDLE_TIMEOUT` | `720h` | session 空闲过期时间 |
+| `TRAE_API_IMPLICIT_SESSION_IDLE_TIMEOUT` | `30m` | 无 session ID 请求的隐式会话空闲过期时间，设为 `0` 禁用 |
+| `TRAE_API_STATE_DIR` | `$XDG_STATE_HOME/trae-api`（无则 `~/.local/state/trae-api`） | 状态目录，保存会话映射以支持重启后续聊；显式置空关闭 |
+| `TRAE_API_WARM_PROCESSES` | `4` | 后台预热的空闲 ACP 进程数，设为 `0` 关闭预热 |
+| `TRAE_API_MAX_SESSIONS` | `100` | 稳定 session 数量上限 |
+| `TRAE_API_MAX_PROCESSES` | `100` | trae-cli ACP 进程总数上限 |
 
-显式 session 的外部 ID 与 ACP session 的对应关系持久化在 `TRAE_API_STATE_DIR`（默认开启）下，使服务重启后客户端可用同一 `X-Session-ID` 续聊：首个请求会通过 trae-cli 声明的 `session/load` 能力恢复其磁盘会话（自动还原对话历史、所选模型与权限模式），不需要重放或补一次额外的模型调用。若 trae-cli 不支持 `session/load`、或磁盘上原 ACP 会话已失效（例如被清理），则降级为新建会话并重写映射。默认连续空闲 30 天后过期，过期会同时割除内存与磁盘映射。若 ACP 声明支持
-`session/close`，过期 session 会向 ACP 发送关闭请求。匿名请求使用完整的
-`messages`，prompt 完成后立即从 client 的 ACP session 路由表中释放临时 session。
-某个 session 的 ACP 进程崩溃只会使该 session 失效，下一次请求会重新懒启动该
-session 的进程（磁盘映射仍在，优先尝试 load 恢复）；正在进行的请求会收到 upstream/ACP 错误。
+## 注意事项
 
-无 session ID 的请求应在每次请求中携带完整消息历史。显式 session ID 的首次请求
-可以携带初始上下文，后续请求只需携带新增消息，历史由 ACP session 保存。服务端
-不会保存或比较 transcript（隐式会话只保存消息序列的指纹）。若 ACP 不支持 `session/close`，临时 session 的本地
-引用和对应的 trae-cli 进程都会在请求结束时释放。
+- 未设置 `TRAE_API_WORKDIR` 时，工作区是隔离的临时目录，代理不会操作真实文件；任务需要访问项目文件时，务必显式设置 `TRAE_API_WORKDIR`。
+- 默认以 `--yolo` 启动（自动批准工具操作），且默认只监听本机回环地址；如需对外监听必须设置 `TRAE_API_TOKEN`。仅建议在受信任的本机环境中使用。
+- 每个会话独占一个 `trae-cli` 进程，首次请求需要等待进程启动和初始化，后续请求复用进程。
+- 暂不支持图片等结构化消息。
