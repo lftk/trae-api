@@ -1,433 +1,391 @@
 package main
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
-	"slices"
+	"net/url"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
-	acp "github.com/coder/acp-go-sdk"
-	"github.com/google/uuid"
-	openai "github.com/sashabaranov/go-openai"
+	openai "github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/packages/pagination"
 )
 
-const (
-	legacySessionIDHeader     = "X-Session-ID"
-	claudeCodeSessionIDHeader = "X-Claude-Code-Session-Id"
-	maxRequestBody            = 1 << 20
-)
+const maxRequestBody = 4 << 20
 
-func (s *server) chat(w http.ResponseWriter, r *http.Request) {
-	started := time.Now()
-	req, ok := decodeChatRequest(w, r)
-	if !ok {
-		return
-	}
-	externalID := requestSessionID(r)
-	var (
-		lease     *sessionLease
-		continued bool
-		err       error
-	)
-	if externalID != "" {
-		lease, err = s.acquireSession(r.Context(), externalID)
-	} else if s.cfg.ImplicitIdleTimeout > 0 {
-		// No session ID (for example VS Code chat): detect conversation
-		// continuity from the message transcript itself.
-		lease, continued, err = s.acquireImplicitSession(r.Context(), req.Messages)
-	} else {
-		lease, err = s.acquireSession(r.Context(), "")
-	}
-	if err != nil {
-		status := http.StatusBadGateway
-		if errors.Is(err, errSessionLimit) {
-			status = http.StatusServiceUnavailable
-		}
-		writeError(w, status, err.Error())
-		return
-	}
-	defer lease.release()
-	session := lease.session
-	session.mu.Lock()
-	defer session.mu.Unlock()
-	selectedModel, err := session.setModel(r.Context(), req.Model)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if selectedModel != "" {
-		req.Model = selectedModel
-	}
-	prompt := formatPrompt(req.Messages)
-	if continued {
-		// The implicit session's ACP transcript already holds the shared
-		// history; only the trailing user message is new.
-		prompt = formatPrompt(req.Messages[len(req.Messages)-1:])
-	}
-	completionID := "chatcmpl-" + uuid.NewString()
-	slog.Debug("chat request", "method", r.Method, "path", r.URL.Path, "headers", debugHeaders(r.Header), "external_sessionid", externalID, "acp_sessionid", session.sessionID(), "completionid", completionID, "model", req.Model, "stream", req.Stream, "implicit", lease.implicit, "continued", continued)
-	if req.Stream {
-		s.streamChat(w, r, session, lease, completionID, externalID, req.Model, prompt, req.Messages)
-		return
-	}
-	answer, reasoning, usage, sentPrompt, err := session.prompt(r.Context(), prompt, nil)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	recordImplicitFingerprints(lease, req.Messages, answer)
-	if usage == nil {
-		w.Header().Set("X-Usage-Estimated", "true")
-	}
-	if externalID != "" {
-		w.Header().Set("X-Session-ID", externalID)
-	}
-	response := openai.ChatCompletionResponse{
-		ID:      completionID,
-		Object:  "chat.completion",
-		Created: time.Now().Unix(),
-		Model:   req.Model,
-		Choices: []openai.ChatCompletionChoice{{
-			Index: 0,
-			Message: openai.ChatCompletionMessage{
-				Role:             openai.ChatMessageRoleAssistant,
-				Content:          answer,
-				ReasoningContent: reasoning,
-			},
-			FinishReason: openai.FinishReasonStop,
-		}},
-		Usage: openAIUsage(usage, sentPrompt, answer, reasoning),
-	}
-	writeJSONOrLog(w, http.StatusOK, response)
-	updateLastUsed(s, externalID, session.lastUsed)
-	slog.Debug("chat response", "completionid", completionID, "external_sessionid", externalID, "acp_sessionid", session.sessionID(), "usage", response.Usage)
-	slog.Info("chat completed", "completionid", completionID, "sessionid", externalID, "acpsessionid", session.sessionID(), "implicit", lease.implicit, "continued", continued, "elapsed", time.Since(started))
+type decodedRequest struct {
+	Body   json.RawMessage
+	Fields map[string]json.RawMessage
 }
 
-// decodeChatRequest parses and validates the chat completion body, writing
-// the error response and returning false when the request is malformed.
-func decodeChatRequest(w http.ResponseWriter, r *http.Request) (openai.ChatCompletionRequest, bool) {
+func decodeBody(w http.ResponseWriter, r *http.Request) (*decodedRequest, error) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
-	var req openai.ChatCompletionRequest
-	decoder := json.NewDecoder(r.Body)
-	if err := decoder.Decode(&req); err != nil {
-		writeBadRequest(w, err.Error())
-		return req, false
+	d := json.NewDecoder(r.Body)
+	var body json.RawMessage
+	if e := d.Decode(&body); e != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(e, &tooLarge) {
+			return nil, &apiError{413, "request body exceeds 4 MiB limit"}
+		}
+		return nil, badRequest("invalid JSON request")
+	}
+	var raw map[string]json.RawMessage
+	if e := json.Unmarshal(body, &raw); e != nil || raw == nil {
+		return nil, badRequest("request must be a JSON object")
 	}
 	var extra any
-	if err := decoder.Decode(&extra); err != io.EOF {
-		writeBadRequest(w, "multiple JSON values")
-		return req, false
+	if d.Decode(&extra) != io.EOF {
+		return nil, badRequest("multiple JSON values")
 	}
-	if len(req.Messages) == 0 {
-		writeBadRequest(w, "messages is required")
-		return req, false
+	for _, k := range []string{"reasoning_effort", "reasoning", "thinking"} {
+		if v, ok := raw[k]; ok && string(v) != "null" && string(v) != "{}" {
+			return nil, badRequest(k + " is unsupported by the IDE upstream")
+		}
 	}
-	if err := validateMessages(req.Messages); err != nil {
-		writeBadRequest(w, err.Error())
-		return req, false
+	if v, ok := raw["n"]; ok && string(v) != "1" {
+		return nil, badRequest("only n=1 is supported")
 	}
-	return req, true
+	if v, ok := raw["response_format"]; ok && string(v) != "null" {
+		var f struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(v, &f) != nil || f.Type != "text" {
+			return nil, badRequest("only text response_format is supported")
+		}
+	}
+	return &decodedRequest{Body: body, Fields: raw}, nil
 }
-
-func writeBadRequest(w http.ResponseWriter, detail string) {
-	writeError(w, http.StatusBadRequest, "invalid chat completion request: "+detail)
-}
-
-func requestSessionID(r *http.Request) string {
-	if id := r.Header.Get(legacySessionIDHeader); id != "" {
-		return id
-	}
-	return r.Header.Get(claudeCodeSessionIDHeader)
-}
-
-func (s *server) streamChat(
-	w http.ResponseWriter,
-	r *http.Request,
-	session *session,
-	lease *sessionLease,
-	completionID, externalID, model, prompt string,
-	requestMessages []openai.ChatCompletionMessage,
-) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	if externalID != "" {
-		w.Header().Set("X-Session-ID", externalID)
-	}
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeError(w, http.StatusInternalServerError, "streaming is not supported")
+func (s *server) chat(w http.ResponseWriter, r *http.Request) {
+	raw, e := decodeBody(w, r)
+	if e != nil {
+		writeError(w, statusForError(e), e.Error())
 		return
 	}
-	var streamErr error
-	var sawAnswer bool
-	tryWrite := func(value any) bool {
-		if streamErr != nil {
-			return false
-		}
-		if err := writeSSE(w, value); err != nil {
-			streamErr = err
-			return false
-		}
-		return true
-	}
-	initial := streamChunk(completionID, model, openai.ChatCompletionStreamChoiceDelta{
-		Role: openai.ChatMessageRoleAssistant,
-	}, openai.FinishReasonNull)
-	if !tryWrite(initial) {
-		s.logStreamError(completionID, externalID, session, streamErr)
+	req, e := decodeChatRequest(raw.Body)
+	if e != nil {
+		writeError(w, 400, "invalid chat completion request: "+e.Error())
 		return
 	}
-	flusher.Flush()
-	answer, reasoning, usage, sentPrompt, err := session.prompt(r.Context(), prompt, func(item update) {
-		if streamErr != nil {
-			return
+	id := newID("chatcmpl-")
+	created := time.Now().Unix()
+	var sink *streamSink
+	model := req.Model
+	var emit func(delta) error
+	if req.Stream {
+		sink = newStreamSink(w, r)
+		defer sink.close()
+		emit = func(d delta) error {
+			if d.Start {
+				model = d.Model
+				return sink.send("", chatChunk(id, created, model, openai.ChatCompletionChunkChoiceDelta{Role: "assistant"}, "", nil))
+			}
+			if d.Heartbeat {
+				return sink.heartbeat()
+			}
+			value := openai.ChatCompletionChunkChoiceDelta{Content: d.Text}
+			if d.Call != nil {
+				call := openai.ChatCompletionChunkChoiceDeltaToolCall{Index: int64(d.Index), ID: d.Call.ID, Function: openai.ChatCompletionChunkChoiceDeltaToolCallFunction{Name: d.Call.Function.Name, Arguments: d.Call.Function.Arguments}}
+				if call.ID != "" {
+					call.Type = "function"
+				}
+				value.ToolCalls = []openai.ChatCompletionChunkChoiceDeltaToolCall{call}
+			}
+			chunk := chatChunk(id, created, model, value, "", nil)
+			if d.Reasoning == "" {
+				return sink.send("", chunk)
+			}
+			body, err := marshalChatReasoning(chunk, d.Reasoning)
+			if err != nil {
+				return err
+			}
+			return sink.send("", body)
 		}
-		if !item.Reasoning {
-			sawAnswer = sawAnswer || item.Text != ""
-		}
-		delta := openai.ChatCompletionStreamChoiceDelta{}
-		if item.Reasoning {
-			delta.ReasoningContent = item.Text
-		} else {
-			delta.Content = item.Text
-		}
-		if tryWrite(streamChunk(completionID, model, delta, openai.FinishReasonNull)) {
-			flusher.Flush()
-		}
-	})
-	slog.Debug("stream response", "completionid", completionID, "external_sessionid", externalID, "acp_sessionid", session.sessionID(), "usage", usage, "error", err)
-	if streamErr != nil {
-		s.logStreamError(completionID, externalID, session, streamErr)
+	}
+	effective, result, e := s.execute(r.Context(), req, emit)
+	if e != nil {
+		s.writeExecutionError(w, sink, e)
 		return
 	}
-	if err != nil {
-		tryWrite(openai.ErrorResponse{
-			Error: &openai.APIError{
-				Message: err.Error(),
-				Type:    "server_error",
-			},
-		})
-	} else {
-		recordImplicitFingerprints(lease, requestMessages, answer)
-		updateLastUsed(s, externalID, session.lastUsed)
-		if usage == nil {
+	if result.Usage == nil {
+		result.Usage = estimatedUsage(effective, result)
+		if sink == nil {
 			w.Header().Set("X-Usage-Estimated", "true")
 		}
-		// If ACP supplied only thought chunks, prompt() converts them to the
-		// answer after the stream callback has already run. Send that fallback
-		// answer now so a proxy/client does not finish with an empty response.
-		if !sawAnswer && answer != "" {
-			tryWrite(streamChunk(completionID, model, openai.ChatCompletionStreamChoiceDelta{
-				Content: answer,
-			}, openai.FinishReasonNull))
+	}
+	if sink != nil {
+		if e = sink.send("", chatChunk(id, created, effective.Model, openai.ChatCompletionChunkChoiceDelta{}, result.Finish, nil)); e != nil {
+			return
 		}
-		final := streamChunk(completionID, model, openai.ChatCompletionStreamChoiceDelta{}, openai.FinishReasonStop)
-		final.Usage = openAIUsagePtr(usage, sentPrompt, answer, reasoning)
-		if tryWrite(final) {
-			_, streamErr = io.WriteString(w, "data: [DONE]\n\n")
-		}
-	}
-	if streamErr != nil {
-		s.logStreamError(completionID, externalID, session, streamErr)
-		return
-	}
-	flusher.Flush()
-}
-
-func (s *server) logStreamError(completionID, externalID string, session *session, err error) {
-	slog.Error("write chat completion stream", "completionid", completionID, "sessionid", externalID, "acpsessionid", session.sessionID(), "error", err)
-}
-
-// streamChunk builds a chat.completion.chunk response with the given delta.
-func streamChunk(completionID, model string, delta openai.ChatCompletionStreamChoiceDelta, finish openai.FinishReason) openai.ChatCompletionStreamResponse {
-	return openai.ChatCompletionStreamResponse{
-		ID:      completionID,
-		Object:  "chat.completion.chunk",
-		Created: time.Now().Unix(),
-		Model:   model,
-		Choices: []openai.ChatCompletionStreamChoice{{
-			Index:        0,
-			Delta:        delta,
-			FinishReason: finish,
-		}},
-	}
-}
-
-// recordImplicitFingerprints stores the transcript fingerprints used by
-// implicit-session continuity detection. Caller must hold session.mu (both
-// call sites run under it). Recording only happens for implicit leases and
-// only after the request succeeded, so a failed or half-streamed reply never
-// poisons the fingerprint used to recognize the next continuation.
-func recordImplicitFingerprints(lease *sessionLease, requestMessages []openai.ChatCompletionMessage, answer string) {
-	if lease == nil || !lease.implicit {
-		return
-	}
-	assistant := openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant, Content: answer}
-	full := make([]openai.ChatCompletionMessage, 0, len(requestMessages)+1)
-	full = append(full, requestMessages...)
-	full = append(full, assistant)
-	lease.session.recordFingerprints(fingerprintMessages(requestMessages), fingerprintMessages(full))
-}
-
-// updateLastUsed persists the refreshed last-used timestamp for a stable
-// session's mapping (so the idle GC at the next startup can evict it
-// correctly). It is a no-op for anonymous/implicit requests (externalID == "")
-// and disabled stores. Caller may hold session.mu; the store has its own
-// concerns and never touches session.mu. Best-effort: failures are logged.
-func updateLastUsed(s *server, externalID string, lastUsed time.Time) {
-	if externalID == "" {
-		return
-	}
-	if err := s.store.touchLastUsed(externalID, lastUsed); err != nil {
-		slog.Warn("persist session last_used", "sessionid", externalID, "error", err)
-	}
-}
-
-func debugHeaders(headers http.Header) map[string][]string {
-	result := make(map[string][]string, len(headers))
-	for name, values := range headers {
-		if strings.EqualFold(name, "Authorization") ||
-			strings.EqualFold(name, "Cookie") ||
-			strings.EqualFold(name, "Set-Cookie") ||
-			strings.EqualFold(name, "X-API-Key") {
-			result[name] = []string{"<redacted>"}
-			continue
-		}
-		result[name] = slices.Clone(values)
-	}
-	return result
-}
-
-func openAIUsage(usage *acp.Usage, prompt, answer, reasoning string) openai.Usage {
-	if usage == nil {
-		promptTokens := estimateTokens(prompt)
-		completionTokens := estimateTokens(answer + reasoning)
-		return openai.Usage{
-			PromptTokens:     promptTokens,
-			CompletionTokens: completionTokens,
-			TotalTokens:      promptTokens + completionTokens,
-		}
-	}
-	result := openai.Usage{
-		PromptTokens:     usage.InputTokens,
-		CompletionTokens: usage.OutputTokens,
-		TotalTokens:      usage.TotalTokens,
-	}
-	if usage.CachedReadTokens != nil || usage.CachedWriteTokens != nil {
-		result.PromptTokensDetails = &openai.PromptTokensDetails{}
-		if usage.CachedReadTokens != nil {
-			result.PromptTokensDetails.CachedTokens = *usage.CachedReadTokens
-		}
-	}
-	if usage.ThoughtTokens != nil {
-		result.CompletionTokensDetails = &openai.CompletionTokensDetails{
-			ReasoningTokens: *usage.ThoughtTokens,
-		}
-	}
-	return result
-}
-
-// openAIUsagePtr converts ACP usage to OpenAI usage, estimating the token
-// counts when the agent did not report usage.
-func openAIUsagePtr(usage *acp.Usage, prompt, answer, reasoning string) *openai.Usage {
-	result := openAIUsage(usage, prompt, answer, reasoning)
-	return &result
-}
-
-// estimateTokens is a provider-independent fallback for ACP agents that do
-// not return usage. It is intentionally conservative and is marked on the
-// response with X-Usage-Estimated; exact counts require the model tokenizer.
-func estimateTokens(text string) int {
-	count := 0
-	inWord := false
-	for _, r := range text {
-		switch {
-		case unicode.IsSpace(r):
-			inWord = false
-		case unicode.Is(unicode.Han, r) || unicode.IsPunct(r) || unicode.IsSymbol(r):
-			if inWord {
-				count++
-				inWord = false
+		if req.StreamOptions.IncludeUsage {
+			if e = sink.send("", openai.ChatCompletionChunk{ID: id, Object: "chat.completion.chunk", Created: created, Model: effective.Model, Choices: []openai.ChatCompletionChunkChoice{}, Usage: chatUsage(result.Usage)}); e != nil {
+				return
 			}
-			count++
-		default:
-			inWord = true
 		}
+		_ = sink.done()
+		return
 	}
-	if inWord {
-		count++
+	msg := openai.ChatCompletionMessage{Role: "assistant", Content: result.Message.Content}
+	for _, call := range result.Message.ToolCalls {
+		msg.ToolCalls = append(msg.ToolCalls, openai.ChatCompletionMessageToolCallUnion{ID: call.ID, Type: "function", Function: openai.ChatCompletionMessageFunctionToolCallFunction{Name: call.Function.Name, Arguments: call.Function.Arguments}})
 	}
-	return count
+	resultBody := openai.ChatCompletion{ID: id, Object: "chat.completion", Created: created, Model: effective.Model, Choices: []openai.ChatCompletionChoice{{Index: 0, Message: msg, FinishReason: result.Finish}}, Usage: chatUsage(result.Usage)}
+	if result.Reasoning == "" {
+		writeJSON(w, 200, resultBody)
+		return
+	}
+	body, err := marshalChatReasoning(resultBody, result.Reasoning)
+	if err != nil {
+		writeError(w, 500, "could not encode chat completion")
+		return
+	}
+	writeJSON(w, 200, body)
 }
-
+func chatChunk(id string, created int64, model string, d openai.ChatCompletionChunkChoiceDelta, finish string, u *usage) openai.ChatCompletionChunk {
+	return openai.ChatCompletionChunk{ID: id, Object: "chat.completion.chunk", Created: created, Model: model, Choices: []openai.ChatCompletionChunkChoice{{Index: 0, Delta: d, FinishReason: finish}}, Usage: chatUsage(u)}
+}
+func (s *server) models(w http.ResponseWriter, r *http.Request) {
+	c, g, e := s.auth.get(r.Context())
+	if e != nil {
+		writeError(w, statusForError(e), e.Error())
+		return
+	}
+	names, e := s.upstream.modelNames(r.Context(), c, g)
+	if e != nil {
+		writeError(w, statusForError(e), e.Error())
+		return
+	}
+	models := make([]openai.Model, 0, len(names))
+	for _, name := range names {
+		models = append(models, openai.Model{ID: name, Object: "model", Created: 0, OwnedBy: "trae"})
+	}
+	writeJSON(w, 200, pagination.Page[openai.Model]{Object: "list", Data: models})
+}
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSONOrLog(w, http.StatusOK, map[string]any{
-			"status":            "ok",
-			"sessions":          s.sessions.count(),
-			"implicit_sessions": s.implicit.count(),
-		})
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		c, _ := s.auth.snapshot()
+		writeJSON(w, 200, map[string]any{"status": "ok", "logged_in": c.Token != ""})
 	})
 	mux.HandleFunc("GET /v1/models", s.models)
 	mux.HandleFunc("POST /v1/chat/completions", s.chat)
+	mux.HandleFunc("/v1/responses", func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, 501, "Responses API is unsupported; use Chat Completions with full history")
+	})
+	mux.HandleFunc("POST /api/auth/login", s.startLogin)
+	mux.HandleFunc("POST /api/auth/login/status", s.loginStatus)
+	mux.HandleFunc("POST /api/auth/login/cancel", s.cancelLogin)
 	return authMiddleware(s.cfg.APIToken, mux)
 }
-
 func authMiddleware(token string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if token != "" && r.Header.Get("Authorization") != "Bearer "+token {
-			writeError(w, http.StatusUnauthorized, "invalid bearer token")
+		if token == "" && (!localManagementHost(r.Host) || !sameOrigin(r)) {
+			writeError(w, 403, "non-local or cross-origin management request denied")
+			return
+		}
+		valid := token == "" || subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+token)) == 1
+		if !valid && (strings.HasPrefix(r.URL.Path, "/web/") || strings.HasPrefix(r.URL.Path, "/api/auth/")) {
+			_, password, ok := r.BasicAuth()
+			valid = ok && subtle.ConstantTimeCompare([]byte(password), []byte(token)) == 1
+			if !valid {
+				w.Header().Set("WWW-Authenticate", `Basic realm="trae-api login"`)
+			}
+		}
+		if !valid {
+			writeError(w, 401, "invalid API token")
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
-func writeSSE(w io.Writer, value any) error {
-	data, err := json.Marshal(value)
-	if err != nil {
-		return fmt.Errorf("marshal server-sent event: %w", err)
+// Never resolve a hostname here: a rebinding domain can resolve to loopback.
+// Forwarded headers are untrusted when the local gateway has no API token.
+func localManagementHost(host string) bool {
+	u, err := url.Parse("http://" + host)
+	if err != nil || u.Host != host || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return false
 	}
-	if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
-		return fmt.Errorf("write server-sent event: %w", err)
+	h := u.Hostname()
+	if strings.EqualFold(h, "localhost") {
+		return true
 	}
-	return nil
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
 }
-func writeJSON(w http.ResponseWriter, status int, value any) error {
+func sameOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return r.Header.Get("Sec-Fetch-Site") != "cross-site"
+	}
+	return origin == "http://"+r.Host || origin == "https://"+r.Host
+}
+func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(value); err != nil {
-		return fmt.Errorf("encode JSON response: %w", err)
+	if e := json.NewEncoder(w).Encode(v); e != nil {
+		slog.Debug("write response failed", "error", e)
 	}
-	return nil
 }
-func writeError(w http.ResponseWriter, status int, message string) {
-	errorType := "invalid_request_error"
-	if status >= 500 {
-		errorType = "server_error"
+func writeError(w http.ResponseWriter, status int, detail string) {
+	typ := "server_error"
+	if status == 400 {
+		typ = "invalid_request_error"
 	}
-	response := openai.ErrorResponse{
-		Error: &openai.APIError{
-			Message: message,
-			Type:    errorType,
-		},
+	if status == 401 {
+		typ = "authentication_error"
 	}
-	if err := writeJSON(w, status, response); err != nil {
-		slog.Error("write error response", "error", err)
+	writeJSON(w, status, openAIErrorJSON{detail: openai.Error{Message: detail, Type: typ}, includeCode: true})
+}
+func (s *server) writeExecutionError(w http.ResponseWriter, sink *streamSink, e error) {
+	if sink != nil && sink.hasStarted() {
+		_ = sink.send("", openAIErrorJSON{detail: openai.Error{Message: e.Error(), Type: "server_error"}})
+		_ = sink.done()
+		return
 	}
+	writeError(w, statusForError(e), e.Error())
+}
+func debugHeaders(h http.Header) map[string][]string {
+	out := map[string][]string{}
+	for k, v := range h {
+		lower := strings.ToLower(k)
+		if strings.Contains(lower, "token") || strings.Contains(lower, "authorization") || strings.Contains(lower, "cookie") || strings.Contains(lower, "api-key") {
+			out[k] = []string{"<redacted>"}
+		} else {
+			out[k] = append([]string(nil), v...)
+		}
+	}
+	return out
+}
+func estimateTokens(text string) int {
+	count := 0
+	word := false
+	for _, r := range text {
+		if unicode.IsSpace(r) {
+			word = false
+		} else if unicode.Is(unicode.Han, r) || unicode.IsPunct(r) {
+			count++
+			word = false
+		} else if !word {
+			count++
+			word = true
+		}
+	}
+	return count
+}
+func estimatedUsage(r chatRequest, c completion) *usage {
+	in := estimateTokens(jsonText(r.Messages) + jsonText(r.Tools))
+	out := estimateTokens(c.Message.Content + c.Reasoning + jsonText(c.Message.ToolCalls))
+	return &usage{Input: in, Output: out, Total: in + out}
 }
 
-func writeJSONOrLog(w http.ResponseWriter, status int, value any) {
-	if err := writeJSON(w, status, value); err != nil {
-		slog.Error("write JSON response", "error", err)
-	}
+// All writes, including timed heartbeats, use the same mutex. The heartbeat
+// goroutine is joined before the handler returns or writes a terminal frame.
+type streamSink struct {
+	mu                sync.Mutex
+	w                 http.ResponseWriter
+	r                 *http.Request
+	started, finished bool
+	err               error
+	stop              chan struct{}
+	doneCh            chan struct{}
+	once              sync.Once
 }
+
+func newStreamSink(w http.ResponseWriter, r *http.Request) *streamSink {
+	s := &streamSink{w: w, r: r, stop: make(chan struct{}), doneCh: make(chan struct{})}
+	go func() {
+		defer close(s.doneCh)
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.stop:
+				return
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+				_ = s.heartbeat()
+			}
+		}
+	}()
+	return s
+}
+func (s *streamSink) hasStarted() bool { s.mu.Lock(); defer s.mu.Unlock(); return s.started }
+func (s *streamSink) writeLocked(event string, v any) error {
+	if s.err != nil {
+		return s.err
+	}
+	if s.finished {
+		return fmt.Errorf("stream already finished")
+	}
+	if e := s.r.Context().Err(); e != nil {
+		return e
+	}
+	flusher, ok := s.w.(http.Flusher)
+	if !ok {
+		return fmt.Errorf("streaming unsupported")
+	}
+	data, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Errorf("encode stream event: %w", err)
+	}
+	if !s.started {
+		s.w.Header().Set("Content-Type", "text/event-stream")
+		s.w.Header().Set("Cache-Control", "no-cache")
+		s.w.Header().Set("X-Accel-Buffering", "no")
+		s.started = true
+	}
+	_ = http.NewResponseController(s.w).SetWriteDeadline(time.Now().Add(30 * time.Second))
+	if event != "" {
+		_, s.err = fmt.Fprintf(s.w, "event: %s\n", event)
+	}
+	if s.err == nil {
+		_, s.err = fmt.Fprintf(s.w, "data: %s\n\n", data)
+	}
+	if s.err == nil {
+		flusher.Flush()
+	}
+	return s.err
+}
+func (s *streamSink) send(event string, v any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.writeLocked(event, v)
+}
+func (s *streamSink) heartbeat() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.started || s.finished || s.err != nil {
+		return s.err
+	}
+	_ = http.NewResponseController(s.w).SetWriteDeadline(time.Now().Add(30 * time.Second))
+	_, s.err = io.WriteString(s.w, ": keepalive\n\n")
+	if s.err == nil {
+		s.w.(http.Flusher).Flush()
+	}
+	return s.err
+}
+func (s *streamSink) done() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err != nil {
+		return s.err
+	}
+	s.finished = true
+	_ = http.NewResponseController(s.w).SetWriteDeadline(time.Now().Add(30 * time.Second))
+	_, s.err = io.WriteString(s.w, "data: [DONE]\n\n")
+	if s.err == nil {
+		s.w.(http.Flusher).Flush()
+	}
+	return s.err
+}
+func (s *streamSink) finish() { s.mu.Lock(); s.finished = true; s.mu.Unlock() }
+func (s *streamSink) close()  { s.once.Do(func() { close(s.stop); <-s.doneCh }) }
