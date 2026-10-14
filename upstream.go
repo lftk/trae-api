@@ -24,11 +24,18 @@ type traeClient struct {
 	models           []string
 	modelsAt         time.Time
 	modelsGeneration uint64
+	routes           map[string]modelRoute
 }
+type modelRoute struct {
+	function, name, base string
+	most, window         int
+}
+
+var chatFunctions = []string{"chat_v3", "solo_work_lite", "solo_agent", "solo_agent_lite"}
 
 func (t *traeClient) headers(c credential) http.Header {
 	h := http.Header{}
-	values := map[string]string{"Content-Type": "application/json", "Accept": "text/event-stream", "Authorization": "Cloud-IDE-JWT " + c.Token, "X-Cloudide-Token": c.Token, "x-ide-token": c.Token, "x-uid": c.UserID, "x-app-id": "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8", "x-device-id": c.DeviceID, "x-machine-id": c.MachineID, "x-request-id": newID(""), "x-ide-version": t.cfg.IDEVersion, "x-ide-version-code": t.cfg.IDEVersionCode, "x-ide-version-type": "stable", "x-app-version": "default", "x-app-version-code": t.cfg.IDEVersionCode, "x-version-code": t.cfg.IDEVersionCode, "x-device-brand": "83DG", "x-device-type": "windows", "x-device-platform": "windows", "x-os-version": "Windows 11 Pro", "package-type": "stable_cn", "x-lscbd-aid": "787976", "x-lscbd-platform": "windows", "x-ss-dp": "787976", "x-plugin-channel": "icube-ai", "app-version": t.cfg.IDEVersion, "x-bridge-transport": "aha", "x-ahanet-timeout": "86400", "x-lgw-req-sdk-type": "3", "x-net-sdk-domain-dispatch": "1", "x-ttnet-bypass-decompression": "1", "x-ttnet-bypass-cookie": "0", "request-traffic-type": "prod", "User-Agent": "Trae/" + t.cfg.IDEVersion}
+	values := map[string]string{"Content-Type": "application/json", "Accept": "text/event-stream", "Authorization": "Cloud-IDE-JWT " + c.Token, "X-Cloudide-Token": c.Token, "x-ide-token": c.Token, "x-uid": c.UserID, "x-app-id": "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8", "x-device-id": c.DeviceID, "x-machine-id": c.MachineID, "x-request-id": newID(""), "x-ide-version": "0.1.69", "x-ide-version-code": "20260917", "x-ide-version-type": "stable", "x-app-version": "0.1.69", "x-app-version-code": "20260917", "x-version-code": "20260917", "x-device-brand": "ASUS TUF Gaming A15 FA507RM_FA507RM", "x-device-type": "windows", "x-device-platform": "windows", "x-os-version": "Windows 10 Pro", "package-type": "stable_cn", "x-lscbd-aid": "787976", "x-lscbd-platform": "windows", "x-ss-dp": "787976", "x-plugin-channel": "icube-ai", "app-version": "0.1.69", "x-bridge-transport": "aha", "x-ahanet-timeout": "86400", "x-lgw-req-sdk-type": "3", "x-net-sdk-domain-dispatch": "1", "x-ttnet-bypass-decompression": "1", "x-ttnet-bypass-cookie": "0", "request-traffic-type": "prod", "User-Agent": "Trae/0.1.69"}
 	for k, v := range values {
 		h.Set(k, v)
 	}
@@ -36,20 +43,187 @@ func (t *traeClient) headers(c credential) http.Header {
 }
 func (t *traeClient) modelNamesAttempt(ctx context.Context, c credential, g uint64) ([]string, error) {
 	t.mu.Lock()
-	if t.modelsGeneration == g && time.Since(t.modelsAt) < 5*time.Minute {
+	if len(t.models) > 0 && t.modelsGeneration == g && time.Since(t.modelsAt) < 5*time.Minute {
 		names := append([]string(nil), t.models...)
 		t.mu.Unlock()
 		return names, nil
 	}
 	t.mu.Unlock()
-	endpoint := strings.TrimRight(t.cfg.BaseURL, "/") + "/api/remote/v1/models?functions=solo_agent_remote%2Csolo_work_remote%2Csolo_design_remote&show_custom_model=true"
-	req, e := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+	lists := map[string][]map[string]any{}
+	root, err := t.modelJSON(ctx, c, "/api/ide/v1/batch_get_detail_param", map[string]any{"functions": chatFunctions, "agent_type": "", "current_config_info": map[string]any{"config_name": "", "is_custom_model": false}, "mode_type": 0, "access_type": 0, "ab_force_vids": "", "ab_autotest_advanced_mode": 0, "show_custom_model": true})
+	if errors.Is(err, errCredentialRejected) {
+		return nil, err
+	}
+	if err == nil {
+		for _, group := range records(field(root, "function_configs")) {
+			fn := firstString(group, "function")
+			if chatFunction(fn) {
+				lists[fn] = append(lists[fn], records(group["config_info_list"])...)
+			}
+		}
+	}
+	hasBatchModels := false
+	for _, list := range lists {
+		for _, m := range list {
+			if validChatModel(m) {
+				hasBatchModels = true
+				break
+			}
+		}
+	}
+	if !hasBatchModels {
+		var firstErr error
+		for _, fn := range chatFunctions {
+			one, e := t.modelJSON(ctx, c, "/api/ide/v1/get_detail_param", map[string]any{"function": fn, "config_names": nil, "need_prompt": false, "current_config_info": nil, "poly_prompt": true, "mode_type": nil, "agent_type": nil})
+			if errors.Is(e, errCredentialRejected) {
+				return nil, e
+			}
+			if e != nil {
+				if firstErr == nil {
+					firstErr = e
+				}
+				continue
+			}
+			lists[fn] = records(field(one, "config_info_list"))
+		}
+		if len(lists) == 0 && firstErr != nil {
+			return nil, firstErr
+		}
+	}
+	routes := map[string]modelRoute{}
+	entries := map[string][]struct {
+		fn string
+		m  map[string]any
+	}{}
+	for _, fn := range chatFunctions {
+		for _, m := range lists[fn] {
+			if validChatModel(m) {
+				id := firstString(m, "config_name")
+				entries[id] = append(entries[id], struct {
+					fn string
+					m  map[string]any
+				}{fn, m})
+			}
+		}
+	}
+	var names []string
+	for id, group := range entries {
+		chosen := group[0]
+		for _, candidate := range group {
+			if devDetail(candidate.m) != nil {
+				chosen = candidate
+				break
+			}
+		}
+		route := modelRoute{function: chosen.fn, base: id}
+		if dev := devDetail(chosen.m); dev != nil {
+			route.name = firstString(dev, "model_name")
+			route.most = positiveInt(dev["max_tokens"])
+		}
+		routes[id] = route
+		names = append(names, id)
+		if _, separateModel := entries[id+"-max"]; separateModel {
+			continue
+		}
+		for _, entry := range group {
+			if max := detailWithSuffix(entry.m, "__max"); max != nil {
+				window := 0
+				devWindow := 0
+				for _, source := range append([]struct {
+					fn string
+					m  map[string]any
+				}{entry}, group...) {
+					windowInfo := objectValue(source.m["context_window_tokens"])
+					if window == 0 {
+						window = positiveInt(windowInfo["max"])
+					}
+					if devWindow == 0 {
+						devWindow = positiveInt(windowInfo["dev"])
+					}
+				}
+				if window > devWindow && window > 0 {
+					routes[id+"-max"] = modelRoute{function: entry.fn, base: id, name: firstString(max, "model_name"), most: positiveInt(max["max_tokens"]), window: window}
+					names = append(names, id+"-max")
+					break
+				}
+			}
+		}
+	}
+	sort.Strings(names)
+	if len(names) == 0 {
+		return nil, fmt.Errorf("Trae returned no available models")
+	}
+	// Keep the account lock through publication so a late A response cannot
+	// replace B's route table after B has logged in.
+	t.auth.mu.Lock()
+	if t.auth.generation != g || t.auth.cred.Token == "" {
+		t.auth.mu.Unlock()
+		return nil, errLoginRequired
+	}
+	t.mu.Lock()
+	t.models = append([]string(nil), names...)
+	t.modelsAt = time.Now()
+	t.modelsGeneration = g
+	t.routes = routes
+	t.mu.Unlock()
+	t.auth.mu.Unlock()
+	return names, nil
+}
+func field(m map[string]any, key string) any {
+	if v, ok := m[key]; ok {
+		return v
+	}
+	return objectValue(m["data"])[key]
+}
+func records(v any) []map[string]any {
+	xs, _ := v.([]any)
+	out := make([]map[string]any, 0, len(xs))
+	for _, x := range xs {
+		if m := objectValue(x); m != nil {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+func positiveInt(v any) int {
+	n, _ := v.(float64)
+	if n > 0 && n < 1<<30 {
+		return int(n)
+	}
+	return 0
+}
+func chatFunction(fn string) bool {
+	for _, allowed := range chatFunctions {
+		if fn == allowed {
+			return true
+		}
+	}
+	return false
+}
+func validChatModel(m map[string]any) bool {
+	id := firstString(m, "config_name")
+	if id == "" || strings.HasPrefix(strings.ToLower(id), "custom_model") || m["config_switch"] == false || m["is_custom_model"] == true || objectValue(m["display_config"])["is_custom_model"] == true {
+		return false
+	}
+	usage := firstString(m, "usage")
+	return usage == "" || usage == "chat_completion"
+}
+func detailWithSuffix(m map[string]any, suffix string) map[string]any {
+	for _, d := range records(m["model_detail_list"]) {
+		if strings.HasSuffix(firstString(d, "model_name"), suffix) {
+			return d
+		}
+	}
+	return nil
+}
+func devDetail(m map[string]any) map[string]any { return detailWithSuffix(m, "__dev") }
+func (t *traeClient) modelJSON(ctx context.Context, c credential, path string, body any) (map[string]any, error) {
+	req, e := http.NewRequestWithContext(ctx, "POST", strings.TrimRight(t.cfg.BaseURL, "/")+path, bytes.NewBufferString(jsonText(body)))
 	if e != nil {
 		return nil, e
 	}
 	req.Header = t.headers(c)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Origin", "https://solo.trae.cn")
 	resp, e := t.http.Do(req)
 	if e != nil {
 		if ctx.Err() != nil {
@@ -58,47 +232,28 @@ func (t *traeClient) modelNamesAttempt(ctx context.Context, c credential, g uint
 		return nil, fmt.Errorf("Trae model list connection failed")
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == 401 || resp.StatusCode == 403 {
+		return nil, errCredentialRejected
+	}
 	if resp.StatusCode != 200 {
-		if resp.StatusCode == 401 || resp.StatusCode == 403 {
-			return nil, errCredentialRejected
-		}
 		return nil, fmt.Errorf("Trae model list returned HTTP %d", resp.StatusCode)
 	}
-	var root struct {
-		Code int `json:"code"`
-		Data struct {
-			List []struct {
-				Models []struct {
-					Name string `json:"name"`
-				} `json:"models"`
-			} `json:"list"`
-		} `json:"data"`
-	}
-	if e = json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&root); e != nil || root.Code != 0 {
+	var root map[string]any
+	if e = json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&root); e != nil {
 		return nil, fmt.Errorf("invalid Trae model list response")
 	}
-	seen := map[string]bool{}
-	var names []string
-	for _, group := range root.Data.List {
-		for _, m := range group.Models {
-			if m.Name != "" && !seen[m.Name] {
-				names = append(names, m.Name)
-				seen[m.Name] = true
-			}
+	if code := firstString(root, "code"); code != "" && code != "0" {
+		if code == "1001" || code == "401" {
+			return nil, errCredentialRejected
 		}
+		return nil, fmt.Errorf("Trae model list business error")
 	}
-	sort.Strings(names)
-	if len(names) == 0 {
-		return nil, fmt.Errorf("Trae returned no available models")
-	}
-	t.mu.Lock()
-	t.models = append([]string(nil), names...)
-	t.modelsAt = time.Now()
-	t.modelsGeneration = g
-	t.mu.Unlock()
-	return names, nil
+	return root, nil
 }
 func buildIDEBody(r chatRequest, sessionID string) map[string]any {
+	return buildRoutedIDEBody(r, sessionID, modelRoute{function: "solo_work_lite", base: r.Model})
+}
+func buildRoutedIDEBody(r chatRequest, sessionID string, route modelRoute) map[string]any {
 	var messages []any
 	if len(r.Tools) > 0 {
 		messages = append(messages, map[string]any{"role": "system", "content": []any{map[string]string{"type": "text", "text": "Tools belong to the API caller. Request tools using native function calls, then wait for the caller's tool result with the matching call ID. Do not execute tools yourself or claim a file or command succeeded without a successful caller result."}}})
@@ -138,12 +293,34 @@ func buildIDEBody(r chatRequest, sessionID string) map[string]any {
 		messages = append(messages, item)
 	}
 	body := map[string]any{"messages": messages, "config_name": r.Model, "model": r.Model, "function": "solo_work_lite", "stream": true, "request_id": sessionID, "session_id": sessionID}
+	if route.base != "" {
+		body["config_name"] = route.base
+		body["model"] = route.base
+	}
+	if route.function != "" {
+		body["function"] = route.function
+	}
+	if route.name != "" {
+		body["model_name"] = route.name
+	}
 	limit := r.MaxCompletionTokens
 	if limit == 0 {
 		limit = r.MaxTokens
 	}
+	if route.window > 0 && limit == 0 && route.most > 0 {
+		limit = route.most
+	}
 	if limit > 0 {
+		if route.most > 0 && limit > route.most {
+			limit = route.most
+		}
+		if route.window > 0 && limit > route.window {
+			limit = route.window
+		}
 		body["max_tokens"] = limit
+	}
+	if route.window > 0 {
+		body["user_message_context"] = map[string]any{"model_info": map[string]any{"prompt_max_tokens": route.window - limit}}
 	}
 	if r.Temperature != nil {
 		body["temperature"] = *r.Temperature
@@ -168,9 +345,36 @@ func buildIDEBody(r chatRequest, sessionID string) map[string]any {
 	}
 	return body
 }
+func (t *traeClient) resolveRoute(ctx context.Context, c credential, g uint64, model string) (modelRoute, error) {
+	t.mu.Lock()
+	route, ok := t.routes[model]
+	valid := t.modelsGeneration == g && time.Since(t.modelsAt) < 5*time.Minute
+	t.mu.Unlock()
+	if !ok || !valid {
+		// Explicit models need their function and native model name too. Discovery
+		// failures are surfaced rather than silently routing through another mode.
+		if _, err := t.modelNames(ctx, c, g); err != nil {
+			return modelRoute{}, err
+		}
+		t.mu.Lock()
+		route, ok = t.routes[model]
+		t.mu.Unlock()
+		if !ok {
+			return modelRoute{}, badRequest("model is not available for this account")
+		}
+	}
+	if !t.auth.validGeneration(g) {
+		return modelRoute{}, errLoginRequired
+	}
+	return route, nil
+}
 func (t *traeClient) promptAttempt(ctx context.Context, c credential, g uint64, r chatRequest, id string, onDelta func(delta) error) (completion, error) {
+	route, err := t.resolveRoute(ctx, c, g, r.Model)
+	if err != nil {
+		return completion{}, err
+	}
 	endpoint := strings.TrimRight(t.cfg.BaseURL, "/") + "/api/agent/v3/llm_utils_chat"
-	req, e := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewBufferString(jsonText(buildIDEBody(r, id))))
+	req, e := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewBufferString(jsonText(buildRoutedIDEBody(r, id, route))))
 	if e != nil {
 		return completion{}, e
 	}

@@ -3,11 +3,18 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -20,18 +27,20 @@ import (
 var errLoginRequired = errors.New("Trae login required; run trae-api login")
 
 type credential struct {
-	Token            string    `json:"token"`
-	RefreshToken     string    `json:"refresh_token"`
-	UserID           string    `json:"user_id"`
-	ClientID         string    `json:"client_id"`
-	ExpiresAt        time.Time `json:"expires_at"`
-	RefreshExpiresAt time.Time `json:"refresh_expires_at"`
-	DeviceID         string    `json:"device_id"`
-	MachineID        string    `json:"machine_id"`
+	Token            string            `json:"token"`
+	RefreshToken     string            `json:"refresh_token"`
+	UserID           string            `json:"user_id"`
+	ClientID         string            `json:"client_id"`
+	ExpiresAt        time.Time         `json:"expires_at"`
+	RefreshExpiresAt time.Time         `json:"refresh_expires_at"`
+	DeviceID         string            `json:"device_id"`
+	MachineID        string            `json:"machine_id"`
+	DeviceKey        *ecdsa.PrivateKey `json:"-"`
 }
 type loginAttempt struct {
 	expires         time.Time
 	device, machine string
+	key             *ecdsa.PrivateKey
 	generation      uint64
 }
 type loginResult struct {
@@ -186,13 +195,25 @@ func (a *authManager) beginLogin() (string, error) {
 	// A new attempt replaces old attempts; only the latest authorization may win.
 	a.pending = map[string]loginAttempt{}
 	state := newID("")
-	p := loginAttempt{expires: now.Add(10 * time.Minute), device: newID(""), machine: newID(""), generation: a.generation}
+	key, err := newDeviceKey()
+	if err != nil {
+		return "", fmt.Errorf("device key generation failed")
+	}
+	device, err := newDeviceID()
+	if err != nil {
+		return "", fmt.Errorf("device ID generation failed")
+	}
+	machine := make([]byte, 16)
+	if _, err = rand.Read(machine); err != nil {
+		return "", fmt.Errorf("machine ID generation failed")
+	}
+	p := loginAttempt{expires: now.Add(10 * time.Minute), device: device, machine: fmt.Sprintf("%x", machine), key: key, generation: a.generation}
 	a.pending[state] = p
 	a.latestLogin = state
 	a.loginResults[state] = loginResult{Status: "pending", Expires: p.expires}
 	u, _ := url.Parse(a.cfg.AuthURL)
 	q := u.Query()
-	values := map[string]string{"login_version": "1", "auth_from": "solo", "login_channel": "native_ide", "plugin_version": "2.3.24254", "auth_type": "local", "client_id": a.cfg.ClientID, "redirect": "0", "login_trace_id": state, "auth_callback_url": a.callbackURL, "machine_id": p.machine, "device_id": p.device, "x_device_id": p.device, "x_machine_id": p.machine, "x_device_brand": "Mac14,7", "x_device_type": "mac", "x_os_version": "macOS", "x_env": "", "x_app_version": a.cfg.IDEVersion, "x_app_type": "stable", "hide_saas_login": "true"}
+	values := map[string]string{"login_version": "1", "auth_from": "solo", "login_channel": "native_ide", "plugin_version": "2.3.24254", "auth_type": "local", "client_id": a.cfg.ClientID, "redirect": "0", "login_trace_id": state, "auth_callback_url": a.callbackURL, "machine_id": p.machine, "device_id": p.device, "x_device_id": p.device, "x_machine_id": p.machine, "x_device_brand": "ASUS TUF Gaming A15 FA507RM_FA507RM", "x_device_type": "windows", "x_os_version": "Windows 10 Pro", "x_env": "", "x_app_version": a.cfg.IDEVersion, "x_app_type": "stable", "hide_saas_login": "true"}
 	for k, v := range values {
 		q.Set(k, v)
 	}
@@ -239,7 +260,7 @@ func (a *authManager) callback(w http.ResponseWriter, r *http.Request) {
 		fail(400, "仅支持国内版 Trae CN 账号。")
 		return
 	}
-	c := credential{Token: firstString(jwt, "Token", "token"), RefreshToken: firstString(jwt, "RefreshToken", "refreshToken"), UserID: firstString(info, "UserID", "UserId", "userId", "userID"), ClientID: firstString(jwt, "ClientID", "clientId"), DeviceID: p.device, MachineID: p.machine}
+	c := credential{Token: firstString(jwt, "Token", "token"), RefreshToken: firstString(jwt, "RefreshToken", "refreshToken"), UserID: firstString(info, "UserID", "UserId", "userId", "userID"), ClientID: firstString(jwt, "ClientID", "clientId"), DeviceID: p.device, MachineID: p.machine, DeviceKey: p.key}
 	if c.ClientID == "" {
 		c.ClientID = q.Get("clientID")
 	}
@@ -301,10 +322,96 @@ func (a *authManager) callback(w http.ResponseWriter, r *http.Request) {
 	a.loginResults[state] = result
 	fmt.Fprint(w, "<!doctype html><html lang=zh-CN><meta charset=utf-8><title>Trae 登录成功</title><p>登录成功，可以关闭此页面并返回 trae-api。</p></html>")
 }
+func newDeviceID() (string, error) {
+	var out strings.Builder
+	for i := 0; i < 19; i++ {
+		base := int64(10)
+		if i == 0 {
+			base = 9
+		}
+		n, err := rand.Int(rand.Reader, big.NewInt(base))
+		if err != nil {
+			return "", err
+		}
+		d := n.Int64()
+		if i == 0 {
+			d++
+		}
+		out.WriteByte(byte('0' + d))
+	}
+	return out.String(), nil
+}
+func newDeviceKey() (*ecdsa.PrivateKey, error) {
+	return ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+}
+
+const deviceExchangePath = "/trae/api/v3/oauth/ExchangeToken"
+
 func (a *authManager) exchange(ctx context.Context, c credential) (credential, error) {
 	if c.RefreshToken == "" || (!c.RefreshExpiresAt.IsZero() && time.Now().After(c.RefreshExpiresAt)) {
 		return c, errLoginRequired
 	}
+	if c.DeviceKey != nil || c.DeviceID != "" || c.MachineID != "" {
+		if c.DeviceKey == nil || c.DeviceID == "" || c.MachineID == "" {
+			return c, errLoginRequired
+		}
+		return a.boundExchange(ctx, c)
+	}
+	return a.legacyExchange(ctx, c)
+}
+func (a *authManager) boundExchange(ctx context.Context, c credential) (credential, error) {
+	pub, err := x509.MarshalPKIXPublicKey(&c.DeviceKey.PublicKey)
+	if err != nil {
+		return c, fmt.Errorf("device public key encoding failed")
+	}
+	clients := []struct{ id, platform, version string }{{"en1oxy7wnw8j9n", "SOLO_PC", "0.1.64"}, {"ono9krqynydwx5", "IDE_PC", "3.3.99"}}
+	var last error
+	for _, as := range clients {
+		nonce := make([]byte, 16)
+		if _, err = rand.Read(nonce); err != nil {
+			return c, fmt.Errorf("device nonce generation failed")
+		}
+		at := time.Now().Unix()
+		hexNonce := fmt.Sprintf("%x", nonce)
+		text := fmt.Sprintf("POST\n%s\n%s\n%s\n%d\n%s", deviceExchangePath, as.id, c.RefreshToken, at, hexNonce)
+		digest := sha256.Sum256([]byte(text))
+		sig, e := ecdsa.SignASN1(rand.Reader, c.DeviceKey, digest[:])
+		if e != nil {
+			return c, fmt.Errorf("device signing failed")
+		}
+		body := map[string]any{"ClientID": as.id, "ClientSecret": "", "RefreshToken": c.RefreshToken, "IDEVersion": as.version,
+			"DeviceProof": map[string]any{"Signature": base64.StdEncoding.EncodeToString(sig), "Timestamp": at, "Nonce": hexNonce},
+			"DeviceInfo":  map[string]any{"DeviceID": c.DeviceID, "MachineID": c.MachineID, "PlatformCode": as.platform, "DeviceType": "PC", "DeviceName": "", "DeviceModel": "", "ClientVersion": as.version, "DevicePublicKey": string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pub})), "DeviceBrand": "ASUS TUF Gaming A15 FA507RM_FA507RM", "DeviceCPU": "AMD", "OSInfo": "Windows", "OSVersion": "10.0.22631"}}
+		req, e := http.NewRequestWithContext(ctx, "POST", strings.TrimRight(a.cfg.AuthBaseURL, "/")+deviceExchangePath, bytes.NewBufferString(jsonText(body)))
+		if e != nil {
+			return c, e
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		if c.Token != "" {
+			req.Header.Set("Authorization", "Bearer "+c.Token)
+		}
+		resp, e := a.client.Do(req)
+		if e != nil {
+			if ctx.Err() != nil {
+				return c, ctx.Err()
+			}
+			// The server may already have spent the refresh token before the
+			// connection failed. Never send it again to another client.
+			return c, fmt.Errorf("device exchange connection failed")
+		}
+		fresh, parseErr := decodeExchange(resp, c)
+		if parseErr == nil {
+			return fresh, nil
+		}
+		last = parseErr
+		if resp.StatusCode != 401 && resp.StatusCode != 403 {
+			return c, parseErr
+		}
+	}
+	return c, last
+}
+func (a *authManager) legacyExchange(ctx context.Context, c credential) (credential, error) {
 	payload := map[string]string{"ClientID": c.ClientID, "RefreshToken": c.RefreshToken, "ClientSecret": "-", "UserID": c.UserID}
 	req, e := http.NewRequestWithContext(ctx, "POST", strings.TrimRight(a.cfg.AuthBaseURL, "/")+"/cloudide/api/v3/trae/oauth/ExchangeToken", bytes.NewBufferString(jsonText(payload)))
 	if e != nil {
@@ -319,6 +426,9 @@ func (a *authManager) exchange(ctx context.Context, c credential) (credential, e
 		}
 		return c, fmt.Errorf("token exchange connection failed")
 	}
+	return decodeExchange(resp, c)
+}
+func decodeExchange(resp *http.Response, c credential) (credential, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		return c, errLoginRequired
@@ -327,7 +437,7 @@ func (a *authManager) exchange(ctx context.Context, c credential) (credential, e
 		return c, fmt.Errorf("token exchange returned HTTP %d", resp.StatusCode)
 	}
 	var root map[string]any
-	if e = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&root); e != nil {
+	if e := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&root); e != nil {
 		return c, fmt.Errorf("invalid token exchange response")
 	}
 	data := root

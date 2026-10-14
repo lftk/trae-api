@@ -56,6 +56,10 @@ curl http://127.0.0.1:8723/v1/chat/completions \
 
 不支持图片、托管工具、结构化输出、可调 reasoning 参数及非 null 的 `stop`；返回明确 HTTP 400，不静默忽略。temperature/top_p 只透传，IDE 不保证遵循。认证拒绝且没有模型输出时最多刷新重试一次；网络/业务错误或已输出请求不重放。提前刷新临时失败不永久废弃仍有效的令牌。
 
+### 客户端离线接入样例
+
+[examples/README.md](examples/README.md) 给出 Python 标准库客户端与本机模拟网关的运行方法：非流式与 SSE 流式、`reasoning_content`、函数调用及完整历史回传、token/登录失败与断流处理。不执行工具或调用真实模型。
+
 ## 不落盘与旧版本迁移
 
 凭证、刷新令牌仅在当前进程内存，历史完全由客户端提供。服务不读取、写入、恢复或清理任何 credential.json、sessions、conversations-v2 文件；不接触旧版本留下的文件。移除旧配置不会删除旧数据，请由用户自行管理。

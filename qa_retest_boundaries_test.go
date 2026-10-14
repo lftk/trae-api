@@ -39,7 +39,7 @@ func TestQARetestSwitchImmediatelyBeforeRetrySend(t *testing.T) {
 						return
 					}
 					if which == "models" {
-						fmt.Fprint(w, `{"code":0,"data":{"list":[{"models":[{"name":"A-model"}]}]}}`)
+						fmt.Fprint(w, `{"function_configs":[{"function":"chat_v3","config_info_list":[{"config_name":"A-model"}]}]}`)
 					} else {
 						fmt.Fprint(w, textFrames("A-response"))
 					}
