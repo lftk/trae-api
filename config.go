@@ -19,7 +19,7 @@ type config struct {
 }
 
 func defaultConfig() config {
-	return config{Addr: "127.0.0.1:8723", AuthAddr: "127.0.0.1:8765", BaseURL: "https://trae-api-cn.mchost.guru", AuthBaseURL: "https://api.trae.cn", AuthURL: "https://www.trae.cn/authorization", ClientID: "ono9krqynydwx5", IDEVersion: "0.1.52", IDEVersionCode: "20260811", MaxConcurrent: 2, QueueTimeout: time.Minute, RequestTimeout: 5 * time.Minute, ShutdownTimeout: 30 * time.Second}
+	return config{Addr: "127.0.0.1:8723", AuthAddr: "127.0.0.1:8765", BaseURL: "https://trae-api-cn.mchost.guru", AuthBaseURL: "https://api.trae.cn", AuthURL: "https://www.trae.cn/authorization", ClientID: "ono9krqynydwx5", IDEVersion: "3.3.65", IDEVersionCode: "20260401", MaxConcurrent: 2, QueueTimeout: time.Minute, RequestTimeout: 5 * time.Minute, ShutdownTimeout: 30 * time.Second}
 }
 func loadConfig() (config, error) {
 	c := defaultConfig()

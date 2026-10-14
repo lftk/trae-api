@@ -14,8 +14,8 @@ func TestTRAE003ChatFullHistoryToolRoundTrip(t *testing.T) {
 		t.Run(fmt.Sprint(stream), func(t *testing.T) {
 			turns := 0
 			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path == "/api/remote/v1/models" {
-					fmt.Fprint(w, `{"code":0,"data":{"list":[{"models":[{"name":"m"}]}]}}`)
+				if r.URL.Path == "/api/ide/v1/batch_get_detail_param" {
+					fmt.Fprint(w, `{"function_configs":[{"function":"solo_work_lite","config_info_list":[{"config_name":"m"}]}]}`)
 					return
 				}
 				turns++

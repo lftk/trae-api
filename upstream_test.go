@@ -108,9 +108,12 @@ func TestModelsAndIDETransport(t *testing.T) {
 		if r.Header.Get("Authorization") != "Cloud-IDE-JWT test-token" || r.Header.Get("X-Cloudide-Token") != "test-token" {
 			t.Error("wrong auth")
 		}
+		if r.Header.Get("x-app-version") != "0.1.69" || r.Header.Get("x-ide-version") != "0.1.69" || r.Header.Get("x-app-version-code") != "20260917" {
+			t.Errorf("incorrect client version headers: %v", r.Header)
+		}
 		switch r.URL.Path {
-		case "/api/remote/v1/models":
-			fmt.Fprint(w, `{"code":0,"data":{"list":[{"models":[{"name":"model-b"},{"name":"model-a"}]}]}}`)
+		case "/api/ide/v1/batch_get_detail_param":
+			fmt.Fprint(w, `{"function_configs":[{"function":"solo_work_lite","config_info_list":[{"config_name":"model-b"},{"config_name":"model-a"}]}]}`)
 		case "/api/agent/v3/llm_utils_chat":
 			prompts++
 			var body map[string]any

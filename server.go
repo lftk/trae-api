@@ -78,6 +78,11 @@ func (s *server) execute(ctx context.Context, r chatRequest, emit func(delta) er
 		}
 		r.Model = models[0]
 	}
+	// Discover and validate explicit models before emitting a streaming start.
+	// Otherwise an unknown model commits HTTP 200 and an assistant chunk.
+	if _, err := s.upstream.resolveRoute(ctx, c, g, r.Model); err != nil {
+		return r, completion{}, err
+	}
 	latest, latestGeneration, err := s.auth.get(ctx)
 	if err != nil {
 		return r, completion{}, err

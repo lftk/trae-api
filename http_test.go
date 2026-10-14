@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func authenticatedServer(t *testing.T, cfg config) *server {
@@ -16,6 +17,9 @@ func authenticatedServer(t *testing.T, cfg config) *server {
 	s.auth.mu.Lock()
 	s.auth.cred = credential{Token: "test-token", UserID: "account", ClientID: cfg.ClientID}
 	s.auth.mu.Unlock()
+	// Explicit-model transport tests isolate their concern from discovery.
+	s.upstream.routes = map[string]modelRoute{"m": {function: "solo_work_lite", base: "m"}}
+	s.upstream.modelsAt = time.Now()
 	t.Cleanup(s.shutdown)
 	return s
 }

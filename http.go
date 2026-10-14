@@ -166,6 +166,12 @@ func (s *server) models(w http.ResponseWriter, r *http.Request) {
 	for _, name := range names {
 		models = append(models, openai.Model{ID: name, Object: "model", Created: 0, OwnedBy: "trae"})
 	}
+	s.auth.mu.Lock()
+	defer s.auth.mu.Unlock()
+	if s.auth.generation != g || s.auth.cred.Token == "" {
+		writeError(w, 401, errLoginRequired.Error())
+		return
+	}
 	writeJSON(w, 200, pagination.Page[openai.Model]{Object: "list", Data: models})
 }
 func (s *server) routes() http.Handler {
