@@ -43,3 +43,7 @@ go.work.sum
 # Coverage and profiling output
 coverage.out
 coverage.html
+
+# Local review evidence and runtime artifacts
+/evidence/
+*.log

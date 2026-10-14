@@ -1,31 +1,26 @@
 # Repository Instructions
 
-## Layout and Architecture
+## Scope and architecture
 
-- This is a single Go 1.23 module and a single root `package main`; keep implementation and tests in the repository root.
-- `main.go` wires configuration, HTTP routes, signal handling, and graceful shutdown. `config.go` is the source of truth for `TRAE_API_*` parsing and validation.
-- `http.go` exposes the OpenAI-compatible API; `server.go` coordinates lifecycle; `session.go` owns one `trae-cli acp serve` process/session; `acp_client.go` routes ACP notifications.
-- `process_pool.go` owns initialized, unassigned ACP processes. `session_manager.go` owns stable caller session IDs. `persist.go` persists the external-id → ACP session mapping under `TRAE_API_STATE_DIR` so a stable session resumes after restart via trae-cli's `session/load` (trae-cli owns the transcript on disk); it stores only the mapping, never the conversation. A stable external session gets a dedicated process; an anonymous request gets a fresh process and is closed when the request ends. When `TRAE_API_IMPLICIT_SESSION_IDLE_TIMEOUT` is non-zero, anonymous requests are instead routed through `acquireImplicitSession`: message-transcript fingerprints (`session.lastUserFP`/`lastFullFP`, see `fingerprintMessages`) detect conversation continuity so an anonymous client like VS Code Chat reuses a dedicated process; sessions idle-reap after the implicit timeout.
-- Keep Unix/Windows process termination behavior in `process_unix.go` and `process_windows.go` respectively.
+- Single Go module, root package main; only OpenAI Chat Completions is implemented.
+- `main.go` parses service flags and the `login` subcommand, starts the API and fixed authorization listener, and handles shutdown. Keep `version` overridable using `-X main.version=`.
+- `config.go` loads only `TRAE_API_ADDR` and `TRAE_API_TOKEN`. All protocol constants/timeouts are internal defaults. Reject other TRAE_API_* variables; no credential or state directory option exists.
+- `auth.go` owns one in-memory CN account, one-use browser authorization traces, bounded login results, and shared refresh. Credentials never go to a callback-provided host. Callback is fixed at 127.0.0.1:8765 in production; ephemeral test listeners are test seams only.
+- `login_cli.go` talks to the running service, opens the official browser flow with an argv-only OS opener, waits for correlated completion, and cancels on timeout/interrupt. It never starts a background service and never prints credentials or a credential-bearing callback URL. `login_http.go` provides authenticated start/status/cancel management routes.
+- `server.go` only owns account request concurrency and cancellation. Do not retain message history, client sessions, response snapshots, storage, restore, or disk expiry cleanup. Every request supplies complete messages/tools and gets a fresh upstream request ID.
+- `types.go`, `openai_requests.go`, `openai_types.go`, `http.go` normalize and validate text/function-tool inputs and reuse official SDK Chat response types. Add only reasoning_content; do not reimplement standard Chat output schemas.
+- `upstream.go` directly converts requests to the known CN IDE protocol and parses SSE including multiple tool identities and native argument fragments. Never execute caller tools or invent tool success.
+- `/v1/responses` explicitly returns 501 unsupported. Do not add Responses adapters or continuation IDs.
 
-## Commands
+## Validation
 
-Run from the repository root:
+Run `go test ./...`, `go test -race ./...`, `go vet ./...`, and `go build -o trae-api .`. Tests use synthetic credentials, mocked upstreams and injected browser openers. No real-model opt-in test or credential-file loading is included.
 
-```bash
-gofmt -w *.go
-go test ./...
-go test -race ./...
-go build -o trae-api .
-go run .
-```
+## Safety
 
-`trae-cli` must be installed and authenticated for the running service or integration test. The real CLI test is opt-in and makes model requests: `TRAE_API_RUN_INTEGRATION=1 go test -run TestTraeCLIAllowsConcurrentPromptsAcrossDedicatedProcesses ./...`.
-
-## Operational Constraints
-
-- The default listener is loopback (`127.0.0.1:8723`). Binding a non-loopback address requires `TRAE_API_TOKEN`; authentication applies to every route.
-- `TRAE_API_WORKDIR` is required for real project-file access. If unset, startup creates a temporary isolation workspace that is removed on shutdown; do not infer project contents from it.
-- The default ACP command includes `acp serve --yolo`, so treat the service as trusted-local-only unless permissions and workdir are explicitly reviewed.
-- Stable sessions expire according to `TRAE_API_SESSION_IDLE_TIMEOUT` (default 720h); the scan loop closes them and deletes their persisted mapping. The external-id → ACP session mapping is persisted under `TRAE_API_STATE_DIR` (default enabled; explicit empty disables persistence, restoring the historical lossy behavior). On restart a stable session is lazily resumed via trae-cli's `session/load` and degrades to a fresh session if the Agent lacks `LoadSession` or the stored ACP session is gone; the first request after restart pays only a load, not a transcript replay.
-- `TRAE_API_WARM_PROCESSES=0` disables startup warming but the first demand still creates a process. `TRAE_API_MAX_PROCESSES` can make acquisition wait rather than create another process.
+- Never read, overwrite, remove or migrate old credential/history files. No service persistence code may be added.
+- Non-loopback API binding requires Token. Token protects all API and login management routes; all unprotected routes additionally validate literal local Host and same origin to prevent DNS rebinding.
+- Fixed callback only accepts unexpired, current, one-use authorization attempts. Cancelled, superseded or expired in-flight exchanges cannot install credentials.
+- Keep credentials, full authorization callbacks and user message/tool contents out of logs. Browser opener errors must be sanitized; disable environment proxies for local CLI management calls and never follow redirects with gateway tokens.
+- Auth rejection before output permits one refresh/retry; do not replay network errors, business errors or observed output.
+- Do not claim real login/upstream validation from offline tests. Protocol references remain in REFERENCES.md.
