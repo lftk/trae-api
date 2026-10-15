@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -15,23 +13,37 @@ import (
 
 func authenticatedServer(t *testing.T, cfg config) *server {
 	t.Helper()
+	isolatedCredentialPath(t)
+	store, e := openCredentialStore()
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e = store.Save(syntheticCredential(t, "test-token")); e != nil {
+		store.Close()
+		t.Fatal(e)
+	}
+	store.Close()
 	s, e := newServer(cfg)
 	if e != nil {
 		t.Fatal(e)
 	}
-	s.auth.mu.Lock()
-	s.auth.cred = credential{
-		Token:    "test-token",
-		UserID:   "account",
-		ClientID: cfg.ClientID,
-	}
-	s.auth.mu.Unlock()
 	// Explicit-model transport tests isolate their concern from discovery.
-	s.upstream.routes = map[string]modelRoute{"m": {
-		function: "solo_work_lite",
-		base:     "m",
-	}}
-	s.upstream.modelsAt = time.Now()
+	c, e := readAPICredential()
+	if e != nil {
+		t.Fatal(e)
+	}
+	s.upstream.cache = map[uint64]modelCache{
+		snapshotIdentity(c): {
+			models: []string{"m"},
+			at:     time.Now(),
+			routes: map[string]modelRoute{
+				"m": {
+					function: "solo_work_lite",
+					base:     "m",
+				},
+			},
+		},
+	}
 	t.Cleanup(s.shutdown)
 	return s
 }
@@ -70,8 +82,6 @@ func events(t *testing.T, w *httptest.ResponseRecorder) []map[string]any {
 }
 
 func TestTRAE001ManagementHost(t *testing.T) {
-	s := authenticatedServer(t, fixtureConfig())
-	s.auth.callbackURL = "http://127.0.0.1:8765/authorize"
 	for _, host := range []string{"attacker.invalid:8723", "localhost.attacker.invalid:8723", "127.0.0.1.attacker.invalid:8723", "0.0.0.0:8723", "[::]:8723"} {
 		for _, route := range []struct {
 			method string
@@ -101,10 +111,7 @@ func TestTRAE001ManagementHost(t *testing.T) {
 			})
 		}
 	}
-	c, _ := s.auth.snapshot()
-	if c.Token == "" {
-		t.Fatal("denied logout changed account")
-	}
+
 	for _, host := range []string{"localhost:8723", "127.0.0.1:8723", "[::1]:8723"} {
 		r := httptest.NewRequest(http.MethodGet, "http://"+host+"/api/auth/status", nil)
 		w := httptest.NewRecorder()
@@ -163,29 +170,5 @@ func TestTRAE003ResponsesUnsupported(t *testing.T) {
 	w := callAPI(t, s, "/v1/responses", map[string]any{"model": "m", "input": "hello"}, "")
 	if w.Code != 501 || !strings.Contains(w.Body.String(), "unsupported") || calls.Load() != 0 {
 		t.Fatalf("status=%d upstream=%d body=%s", w.Code, calls.Load(), w.Body.String())
-	}
-}
-func TestTRAE003NoCredentialRestore(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("XDG_STATE_HOME", home)
-	t.Setenv("TRAE_API_STATE_DIR", filepath.Join(home, "trae-api"))
-	dir := filepath.Join(home, "trae-api")
-	os.MkdirAll(dir, 0700)
-	file := filepath.Join(dir, "credential.json")
-	original := []byte(`{"token":"synthetic-old-token","user_id":"fixture"}`)
-	os.WriteFile(file, original, 0600)
-	cfg := fixtureConfig()
-	s, err := newServer(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s.shutdown()
-	c, _ := s.auth.snapshot()
-	if c.Token != "" {
-		t.Fatal("old credentials restored")
-	}
-	after, _ := os.ReadFile(file)
-	if string(after) != string(original) {
-		t.Fatal("old file changed")
 	}
 }

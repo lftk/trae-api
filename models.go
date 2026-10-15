@@ -4,26 +4,76 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 type traeClient struct {
-	cfg              config
-	http             *http.Client
-	auth             *authManager
-	mu               sync.Mutex
-	models           []string
-	modelsAt         time.Time
-	modelsGeneration uint64
-	routes           map[string]modelRoute
+	cfg   config
+	http  *http.Client
+	mu    sync.Mutex
+	cache map[uint64]modelCache
+}
+
+type modelCache struct {
+	models []string
+	at     time.Time
+	routes map[string]modelRoute
+}
+
+const modelCacheTTL = 5 * time.Minute
+const modelCacheCapacity = 8
+
+// Call with t.mu held; both model names and routes expire together.
+func (t *traeClient) pruneModelCache(now time.Time) {
+	for key, cached := range t.cache {
+		if now.Sub(cached.at) >= modelCacheTTL {
+			delete(t.cache, key)
+		}
+	}
+}
+
+func apiObjectValue(v any) map[string]any {
+	if m, ok := v.(map[string]any); ok {
+		return m
+	}
+	if s, ok := v.(string); ok {
+		var m map[string]any
+		_ = json.Unmarshal([]byte(s), &m)
+		return m
+	}
+	return nil
+}
+
+func apiFirstString(m map[string]any, keys ...string) string {
+	for _, k := range keys {
+		switch v := m[k].(type) {
+		case string:
+			if v != "" {
+				return v
+			}
+		case float64:
+			return strconv.FormatFloat(v, 'f', -1, 64)
+		}
+	}
+	return ""
+}
+
+// The digest identifies a narrow access snapshot without keeping its token
+// in cache keys or coupling it to Auth's mutable generation counter.
+func snapshotIdentity(c apiCredential) uint64 {
+	h := sha256.Sum256([]byte(jsonText(c)))
+	return binary.BigEndian.Uint64(h[:8])
 }
 
 type modelRoute struct {
@@ -56,7 +106,7 @@ type modelConfig struct {
 
 var chatFunctions = []string{"chat_v3", "solo_work_lite", "solo_agent", "solo_agent_lite"}
 
-func (t *traeClient) headers(c credential) http.Header {
+func (t *traeClient) headers(c apiCredential) http.Header {
 	h := http.Header{}
 	values := map[string]string{
 		"Content-Type":                 "application/json",
@@ -100,10 +150,11 @@ func (t *traeClient) headers(c credential) http.Header {
 	return h
 }
 
-func (t *traeClient) modelNamesAttempt(ctx context.Context, c credential, g uint64) ([]string, error) {
+func (t *traeClient) modelNamesAttempt(ctx context.Context, c apiCredential, g uint64) ([]string, error) {
 	t.mu.Lock()
-	if len(t.models) > 0 && t.modelsGeneration == g && time.Since(t.modelsAt) < 5*time.Minute {
-		names := append([]string(nil), t.models...)
+	t.pruneModelCache(time.Now())
+	if cached := t.cache[g]; len(cached.models) > 0 {
+		names := append([]string(nil), cached.models...)
 		t.mu.Unlock()
 		return names, nil
 	}
@@ -124,7 +175,7 @@ func (t *traeClient) modelNamesAttempt(ctx context.Context, c credential, g uint
 	}
 	if err == nil {
 		for _, group := range records(field(root, "function_configs")) {
-			fn := firstString(group, "function")
+			fn := apiFirstString(group, "function")
 			if chatFunction(fn) {
 				lists[fn] = append(lists[fn], modelConfigs(group["config_info_list"])...)
 			}
@@ -231,20 +282,28 @@ func (t *traeClient) modelNamesAttempt(ctx context.Context, c credential, g uint
 	if len(names) == 0 {
 		return nil, fmt.Errorf("Trae returned no available models")
 	}
-	// Keep the account lock through publication so a late A response cannot
-	// replace B's route table after B has logged in.
-	t.auth.mu.Lock()
-	if t.auth.generation != g || t.auth.cred.Token == "" {
-		t.auth.mu.Unlock()
-		return nil, errLoginRequired
-	}
 	t.mu.Lock()
-	t.models = append([]string(nil), names...)
-	t.modelsAt = time.Now()
-	t.modelsGeneration = g
-	t.routes = routes
+	if t.cache == nil {
+		t.cache = make(map[uint64]modelCache)
+	}
+	now := time.Now()
+	t.pruneModelCache(now)
+	if _, present := t.cache[g]; !present && len(t.cache) >= modelCacheCapacity {
+		var oldest uint64
+		var oldestAt time.Time
+		for key, cached := range t.cache {
+			if oldestAt.IsZero() || cached.at.Before(oldestAt) {
+				oldest, oldestAt = key, cached.at
+			}
+		}
+		delete(t.cache, oldest)
+	}
+	t.cache[g] = modelCache{
+		models: append([]string(nil), names...),
+		at:     now,
+		routes: routes,
+	}
 	t.mu.Unlock()
-	t.auth.mu.Unlock()
 	return names, nil
 }
 
@@ -252,14 +311,14 @@ func field(m map[string]any, key string) any {
 	if v, ok := m[key]; ok {
 		return v
 	}
-	return objectValue(m["data"])[key]
+	return apiObjectValue(m["data"])[key]
 }
 
 func records(v any) []map[string]any {
 	xs, _ := v.([]any)
 	out := make([]map[string]any, 0, len(xs))
 	for _, x := range xs {
-		if m := objectValue(x); m != nil {
+		if m := apiObjectValue(x); m != nil {
 			out = append(out, m)
 		}
 	}
@@ -287,17 +346,17 @@ func modelConfigs(v any) []modelConfig {
 	var configs []modelConfig
 	for _, raw := range records(v) {
 		config := modelConfig{
-			name:    firstString(raw, "config_name"),
-			usage:   firstString(raw, "usage"),
+			name:    apiFirstString(raw, "config_name"),
+			usage:   apiFirstString(raw, "usage"),
 			enabled: raw["config_switch"] != false,
-			custom:  raw["is_custom_model"] == true || objectValue(raw["display_config"])["is_custom_model"] == true,
+			custom:  raw["is_custom_model"] == true || apiObjectValue(raw["display_config"])["is_custom_model"] == true,
 		}
-		window := objectValue(raw["context_window_tokens"])
+		window := apiObjectValue(raw["context_window_tokens"])
 		config.devWindow = positiveInt(window["dev"])
 		config.maxWindow = positiveInt(window["max"])
 		for _, detail := range records(raw["model_detail_list"]) {
 			config.details = append(config.details, modelDetail{
-				name:      firstString(detail, "model_name"),
+				name:      apiFirstString(detail, "model_name"),
 				maxTokens: positiveInt(detail["max_tokens"]),
 			})
 		}
@@ -322,7 +381,7 @@ func (m modelConfig) detail(suffix string) *modelDetail {
 	return nil
 }
 
-func (t *traeClient) modelJSON(ctx context.Context, c credential, path string, body any) (map[string]any, error) {
+func (t *traeClient) modelJSON(ctx context.Context, c apiCredential, path string, body any) (map[string]any, error) {
 	req, e := http.NewRequestWithContext(ctx, "POST", strings.TrimRight(t.cfg.BaseURL, "/")+path, bytes.NewBufferString(jsonText(body)))
 	if e != nil {
 		return nil, e
@@ -347,8 +406,8 @@ func (t *traeClient) modelJSON(ctx context.Context, c credential, path string, b
 	if e = json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&root); e != nil {
 		return nil, fmt.Errorf("invalid Trae model list response")
 	}
-	if code := firstString(root, "code"); code != "" && code != "0" {
-		if code == "1001" || code == "401" {
+	if code := apiFirstString(root, "code"); code != "" && code != "0" {
+		if code == "1001" || code == "401" || code == "403" {
 			return nil, errCredentialRejected
 		}
 		return nil, fmt.Errorf("Trae model list business error")
@@ -356,21 +415,9 @@ func (t *traeClient) modelJSON(ctx context.Context, c credential, path string, b
 	return root, nil
 }
 
-func (t *traeClient) modelNames(ctx context.Context, c credential, g uint64) ([]string, error) {
+func (t *traeClient) modelNames(ctx context.Context, c apiCredential, g uint64) ([]string, error) {
 	names, e := t.modelNamesAttempt(ctx, c, g)
 	if errors.Is(e, errCredentialRejected) {
-		fresh, newGeneration, err := t.auth.refreshRejected(ctx, c.Token, g)
-		if err != nil {
-			return nil, err
-		}
-		if newGeneration != g || !t.auth.validGeneration(g) {
-			return nil, errLoginRequired
-		}
-		c, g = fresh, newGeneration
-		names, e = t.modelNamesAttempt(ctx, c, g)
-	}
-	if errors.Is(e, errCredentialRejected) {
-		t.auth.invalidate(g, c.Token)
 		return nil, errLoginRequired
 	}
 	return names, e

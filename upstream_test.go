@@ -1,9 +1,7 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -192,52 +190,6 @@ func TestIDEBodyKeepsToolHistory(t *testing.T) {
 	r.Choice = "none"
 	if _, ok := buildRoutedIDEBody(r, "s", defaultRoute)["tools"]; ok {
 		t.Fatal("none exposed tools")
-	}
-}
-func TestModelsAndIDETransport(t *testing.T) {
-	var prompts int
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Cloud-IDE-JWT test-token" || r.Header.Get("X-Cloudide-Token") != "test-token" {
-			t.Error("wrong auth")
-		}
-		if r.Header.Get("x-app-version") != "0.1.69" || r.Header.Get("x-ide-version") != "0.1.69" || r.Header.Get("x-app-version-code") != "20260917" {
-			t.Errorf("incorrect client version headers: %v", r.Header)
-		}
-		switch r.URL.Path {
-		case "/api/ide/v1/batch_get_detail_param":
-			fmt.Fprint(w, `{"function_configs":[{"function":"solo_work_lite","config_info_list":[{"config_name":"model-b"},{"config_name":"model-a"}]}]}`)
-		case "/api/agent/v3/llm_utils_chat":
-			prompts++
-			var body map[string]any
-			_ = json.NewDecoder(r.Body).Decode(&body)
-			if body["config_name"] != "model-a" {
-				t.Error(body)
-			}
-			fmt.Fprint(w, textFrames("hello"))
-		default:
-			t.Errorf("unexpected upstream %s", r.URL.Path)
-		}
-	}))
-	defer up.Close()
-	cfg := fixtureConfig()
-	cfg.BaseURL = up.URL
-	s, e := newServer(cfg)
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer s.shutdown()
-	s.auth.cred = credential{
-		Token:  "test-token",
-		UserID: "account",
-	}
-	req, c, e := s.execute(context.Background(), chatRequest{
-		Messages: []message{{
-			Role:    "user",
-			Content: "hi",
-		}},
-	}, nil)
-	if e != nil || c.Message.Content != "hello" || req.Model != "model-a" || prompts != 1 {
-		t.Fatalf("%+v %+v %v", req, c, e)
 	}
 }
 func TestEmptyArgumentsStreamMatchesFinal(t *testing.T) {

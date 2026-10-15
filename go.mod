@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/openai/openai-go/v3 v3.50.0
 	github.com/tidwall/sjson v1.2.5
+	github.com/urfave/cli/v3 v3.14.0
 )
 
 require (
