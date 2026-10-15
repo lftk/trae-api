@@ -14,13 +14,6 @@ import (
 	"time"
 )
 
-func buildIDEBody(r chatRequest, sessionID string) map[string]any {
-	return buildRoutedIDEBody(r, sessionID, modelRoute{
-		function: "solo_work_lite",
-		base:     r.Model,
-	})
-}
-
 func buildRoutedIDEBody(r chatRequest, sessionID string, route modelRoute) map[string]any {
 	var messages []any
 	if len(r.Tools) > 0 {
