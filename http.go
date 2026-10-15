@@ -17,65 +17,58 @@ import (
 
 	openai "github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/packages/pagination"
+	"github.com/tidwall/sjson"
 )
 
 const maxRequestBody = 4 << 20
 
-type decodedRequest struct {
-	Body   json.RawMessage
-	Fields map[string]json.RawMessage
-}
-
-func decodeBody(w http.ResponseWriter, r *http.Request) (*decodedRequest, error) {
+func decodeBody(w http.ResponseWriter, r *http.Request) (json.RawMessage, map[string]json.RawMessage, error) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 	d := json.NewDecoder(r.Body)
 	var body json.RawMessage
 	if e := d.Decode(&body); e != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(e, &tooLarge) {
-			return nil, &apiError{
+			return nil, nil, &apiError{
 				413,
 				"request body exceeds 4 MiB limit",
 			}
 		}
-		return nil, badRequest("invalid JSON request")
+		return nil, nil, badRequest("invalid JSON request")
 	}
 	var raw map[string]json.RawMessage
 	if e := json.Unmarshal(body, &raw); e != nil || raw == nil {
-		return nil, badRequest("request must be a JSON object")
+		return nil, nil, badRequest("request must be a JSON object")
 	}
 	var extra any
 	if d.Decode(&extra) != io.EOF {
-		return nil, badRequest("multiple JSON values")
+		return nil, nil, badRequest("multiple JSON values")
 	}
 	for _, k := range []string{"reasoning_effort", "reasoning", "thinking"} {
 		if v, ok := raw[k]; ok && string(v) != "null" && string(v) != "{}" {
-			return nil, badRequest(k + " is unsupported by the IDE upstream")
+			return nil, nil, badRequest(k + " is unsupported by the IDE upstream")
 		}
 	}
 	if v, ok := raw["n"]; ok && string(v) != "1" {
-		return nil, badRequest("only n=1 is supported")
+		return nil, nil, badRequest("only n=1 is supported")
 	}
 	if v, ok := raw["response_format"]; ok && string(v) != "null" {
 		var f struct {
 			Type string `json:"type"`
 		}
 		if json.Unmarshal(v, &f) != nil || f.Type != "text" {
-			return nil, badRequest("only text response_format is supported")
+			return nil, nil, badRequest("only text response_format is supported")
 		}
 	}
-	return &decodedRequest{
-		Body:   body,
-		Fields: raw,
-	}, nil
+	return body, raw, nil
 }
 func (s *server) chat(w http.ResponseWriter, r *http.Request) {
-	raw, e := decodeBody(w, r)
+	body, fields, e := decodeBody(w, r)
 	if e != nil {
 		writeError(w, statusForError(e), e.Error())
 		return
 	}
-	req, e := decodeChatRequest(raw.Body)
+	req, e := decodeChatRequest(body, fields)
 	if e != nil {
 		writeError(w, 400, "invalid chat completion request: "+e.Error())
 		return
@@ -491,5 +484,83 @@ func (s *streamSink) close() {
 	s.once.Do(func() {
 		close(s.stop)
 		<-s.doneCh
+	})
+}
+
+// Chat responses use the SDK's default JSON encoding. The only addition is
+// reasoning_content, a Trae extension absent from the official SDK model.
+func marshalChatReasoning[T openai.ChatCompletion | openai.ChatCompletionChunk](value T, reasoning string) (json.RawMessage, error) {
+	data, err := json.Marshal(value)
+	if err != nil || reasoning == "" {
+		return data, err
+	}
+	path := "choices.0.message.reasoning_content"
+	if _, stream := any(value).(openai.ChatCompletionChunk); stream {
+		path = "choices.0.delta.reasoning_content"
+	}
+	data, err = sjson.SetBytes(data, path, reasoning)
+	return data, err
+}
+
+func chatUsage(u *usage) openai.CompletionUsage {
+	if u == nil {
+		return openai.CompletionUsage{}
+	}
+	v := openai.CompletionUsage{
+		PromptTokens:     int64(u.Input),
+		CompletionTokens: int64(u.Output),
+		TotalTokens:      int64(u.Total),
+	}
+	if u.InputDetails != nil {
+		v.PromptTokensDetails.CachedTokens = int64(u.InputDetails.CachedTokens)
+	}
+	if u.OutputDetails != nil {
+		v.CompletionTokensDetails.ReasoningTokens = int64(u.OutputDetails.ReasoningTokens)
+	}
+	return v
+}
+
+// rawJSONFields is transient serialized JSON, never the request/response model.
+// It lets the adapters fix null/omission semantics without re-declaring SDK
+// fields. Encoding errors propagate before any stream headers are sent.
+type rawJSONFields map[string]json.RawMessage
+
+func jsonFields(v any) (rawJSONFields, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	var fields rawJSONFields
+	if err = json.Unmarshal(b, &fields); err != nil {
+		return nil, err
+	}
+	return fields, nil
+}
+func (f rawJSONFields) drop(keys ...string) {
+	for _, k := range keys {
+		delete(f, k)
+	}
+}
+
+type openAIErrorJSON struct {
+	detail      openai.Error
+	includeCode bool
+}
+
+func (v openAIErrorJSON) MarshalJSON() ([]byte, error) {
+	fields, err := jsonFields(v.detail)
+	if err != nil {
+		return nil, err
+	}
+	fields.drop("StatusCode", "Request", "Response", "param")
+	if v.includeCode {
+		fields["code"] = json.RawMessage("null")
+	} else {
+		fields.drop("code")
+	}
+	return json.Marshal(struct {
+		Error rawJSONFields `json:"error"`
+	}{
+		fields,
 	})
 }

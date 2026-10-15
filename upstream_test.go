@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -172,7 +173,11 @@ func TestIDEBodyKeepsToolHistory(t *testing.T) {
 			Content:    "file content",
 		}},
 	}
-	body := buildIDEBody(r, "session")
+	defaultRoute := modelRoute{
+		function: "solo_work_lite",
+		base:     r.Model,
+	}
+	body := buildRoutedIDEBody(r, "session", defaultRoute)
 	wire := jsonText(body)
 	for _, want := range []string{`"function":"solo_work_lite"`, `"function_call"`, `"tool_call_id":"a"`, `"name":"read_file"`, `"role":"system"`, `"stream":true`} {
 		if !strings.Contains(wire, want) {
@@ -185,7 +190,7 @@ func TestIDEBodyKeepsToolHistory(t *testing.T) {
 		t.Fatal("schema is not a JSON string")
 	}
 	r.Choice = "none"
-	if _, ok := buildIDEBody(r, "s")["tools"]; ok {
+	if _, ok := buildRoutedIDEBody(r, "s", defaultRoute)["tools"]; ok {
 		t.Fatal("none exposed tools")
 	}
 }
@@ -251,4 +256,35 @@ func TestEmptyArgumentsStreamMatchesFinal(t *testing.T) {
 		t.Fatalf("%+v %s %v", c, args, e)
 	}
 
+}
+
+func TestTRAE003IdleSSEDeadlineRenewal(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s := newStreamSink(w, r)
+		defer s.close()
+		if err := s.send("", map[string]string{"text": "start"}); err != nil {
+			return
+		}
+		timer := time.NewTimer(32 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-r.Context().Done():
+			return
+		case <-timer.C:
+		}
+		_ = s.done()
+	}))
+	defer up.Close()
+	c := &http.Client{
+		Timeout: 40 * time.Second,
+	}
+	resp, err := c.Get(up.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil || !strings.Contains(string(b), "[DONE]") {
+		t.Fatalf("idle stream lost terminal frame: %v %q", err, b)
+	}
 }

@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	openai "github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/packages/param"
 )
 
 type function struct {
@@ -25,34 +28,44 @@ type message struct {
 	Name       string     `json:"name,omitempty"`
 }
 
+type chatMessageInputFields struct {
+	Role       string          `json:"role"`
+	Content    json.RawMessage `json:"content"`
+	ToolCalls  []toolCall      `json:"tool_calls"`
+	Name       string          `json:"name"`
+	ToolCallID string          `json:"tool_call_id"`
+}
+
 func (m *message) UnmarshalJSON(b []byte) error {
-	var v struct {
-		Role       string          `json:"role"`
-		Content    json.RawMessage `json:"content"`
-		ToolCalls  []toolCall      `json:"tool_calls"`
-		ToolCallID string          `json:"tool_call_id"`
-		Name       string          `json:"name"`
-	}
+	var v chatMessageInputFields
 	if err := json.Unmarshal(b, &v); err != nil {
 		return err
 	}
-	text, err := textContent(v.Content)
+	normalized, err := normalizeMessage(v)
 	if err != nil {
 		return err
+	}
+	*m = normalized
+	return nil
+}
+
+func normalizeMessage(v chatMessageInputFields) (message, error) {
+	text, err := textContent(v.Content)
+	if err != nil {
+		return message{}, err
 	}
 	for i := range v.ToolCalls {
 		if v.ToolCalls[i].Type == "" {
 			v.ToolCalls[i].Type = "function"
 		}
 	}
-	*m = message{
+	return message{
 		Role:       v.Role,
 		Content:    text,
 		ToolCalls:  v.ToolCalls,
 		ToolCallID: v.ToolCallID,
 		Name:       v.Name,
-	}
-	return nil
+	}, nil
 }
 func textContent(raw json.RawMessage) (string, error) {
 	if len(raw) == 0 || string(raw) == "null" {
@@ -131,7 +144,6 @@ type delta struct {
 	Heartbeat bool
 	Start     bool
 	Model     string
-	Tools     []tool
 }
 
 func newID(prefix string) string {
@@ -253,4 +265,94 @@ func validateToolHistory(ms []message) error {
 		return fmt.Errorf("all pending tool calls require results")
 	}
 	return nil
+}
+
+func optionalPointer[T comparable](v param.Opt[T]) *T {
+	if v.Valid() {
+		return &v.Value
+	}
+	return nil
+}
+
+// SDK request parameters omit stream (the SDK selects it via NewStreaming).
+// Raw content preserves text/input_text/output_text aliases and rejects
+// unsupported modalities that a permissive SDK union could discard.
+type chatToolInputFields struct {
+	Type     string `json:"type"`
+	Function struct {
+		Name        string          `json:"name"`
+		Description string          `json:"description"`
+		Strict      *bool           `json:"strict"`
+		Parameters  json.RawMessage `json:"parameters"`
+	} `json:"function"`
+}
+
+func decodeChatRequest(body json.RawMessage, raw map[string]json.RawMessage) (chatRequest, error) {
+	if stop, ok := raw["stop"]; ok && string(stop) != "null" {
+		return chatRequest{}, fmt.Errorf("stop is unsupported by the IDE upstream")
+	}
+	var sdk openai.ChatCompletionNewParams
+	if err := json.Unmarshal(body, &sdk); err != nil {
+		return chatRequest{}, err
+	}
+	var fields struct {
+		Model               string   `json:"model"`
+		MaxTokens           int64    `json:"max_tokens"`
+		MaxCompletionTokens int64    `json:"max_completion_tokens"`
+		Parallel            *bool    `json:"parallel_tool_calls"`
+		Temperature         *float64 `json:"temperature"`
+		TopP                *float64 `json:"top_p"`
+		StreamOptions       struct {
+			IncludeUsage bool `json:"include_usage"`
+		} `json:"stream_options"`
+		Stream     bool                     `json:"stream"`
+		Messages   []chatMessageInputFields `json:"messages"`
+		Tools      []chatToolInputFields    `json:"tools"`
+		ToolChoice json.RawMessage          `json:"tool_choice"`
+	}
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return chatRequest{}, err
+	}
+	req := chatRequest{
+		Model:               string(sdk.Model),
+		Stream:              fields.Stream,
+		Parallel:            optionalPointer(sdk.ParallelToolCalls),
+		MaxTokens:           int(sdk.MaxTokens.Value),
+		MaxCompletionTokens: int(sdk.MaxCompletionTokens.Value),
+		Temperature:         optionalPointer(sdk.Temperature),
+		TopP:                optionalPointer(sdk.TopP),
+		ToolChoice:          fields.ToolChoice,
+	}
+	req.StreamOptions.IncludeUsage = sdk.StreamOptions.IncludeUsage.Value
+	if len(fields.Messages) != len(sdk.Messages) || len(fields.Tools) != len(sdk.Tools) {
+		return req, fmt.Errorf("invalid request arrays")
+	}
+	for i, m := range sdk.Messages {
+		f := fields.Messages[i]
+		normalized, err := normalizeMessage(f)
+		if err != nil {
+			return req, err
+		}
+		role := m.GetRole()
+		if role == nil || *role != f.Role {
+			return req, fmt.Errorf("unsupported role %q", f.Role)
+		}
+		req.Messages = append(req.Messages, normalized)
+	}
+	for i, t := range sdk.Tools {
+		f := fields.Tools[i]
+		if f.Type != "function" || t.OfFunction == nil {
+			return req, fmt.Errorf("only named function tools are supported")
+		}
+		fn := t.OfFunction.Function
+		v := tool{
+			Type: "function",
+		}
+		v.Function.Name = fn.Name
+		v.Function.Description = fn.Description.Value
+		v.Function.Parameters = f.Function.Parameters
+		v.Function.Strict = optionalPointer(fn.Strict)
+		req.Tools = append(req.Tools, v)
+	}
+	return req, nil
 }
