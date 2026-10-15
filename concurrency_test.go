@@ -308,14 +308,10 @@ func TestTRAE003RefreshIdentityFormats(t *testing.T) {
 
 func TestTRAE003CallbackAllowsOfficialTopLevelRedirect(t *testing.T) {
 	cfg := fixtureConfig()
-	cfg.AuthAddr = "127.0.0.1:0"
+	cfg.Addr = "127.0.0.1:0"
 	s, _ := newServer(cfg)
 	defer s.shutdown()
-	listener, err := s.startAuthListener()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
+	startSingleTestServer(t, s)
 	link, err := s.auth.beginLogin()
 	if err != nil {
 		t.Fatal(err)
@@ -722,14 +718,10 @@ func TestQA003InFlightCancelAndReplaceCannotCommit(t *testing.T) {
 
 func TestQA003CallbackRejectsUntrustedHost(t *testing.T) {
 	cfg := fixtureConfig()
-	cfg.AuthAddr = "127.0.0.1:0"
+	cfg.Addr = "127.0.0.1:0"
 	s, _ := newServer(cfg)
 	defer s.shutdown()
-	listener, err := s.startAuthListener()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
+	startSingleTestServer(t, s)
 	link, _ := s.auth.beginLogin()
 	u, _ := url.Parse(link)
 	id := u.Query().Get("login_trace_id")

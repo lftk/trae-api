@@ -23,7 +23,8 @@ import (
 var version = "dev"
 
 func main() {
-	if code, stop := parseFlags(os.Args[1:], os.Stdout, os.Stderr); stop {
+	action, code := parseCommand(os.Args[1:], os.Stdout, os.Stderr)
+	if action == commandExit {
 		os.Exit(code)
 	}
 	cfg, err := loadConfig()
@@ -31,7 +32,7 @@ func main() {
 		slog.Error("load configuration", "error", err)
 		os.Exit(1)
 	}
-	if len(os.Args) > 1 && os.Args[1] == "login" {
+	if action == commandLogin {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		if err := runLogin(ctx, cfg, os.Stdout, openOfficialBrowser, 500*time.Millisecond, 10*time.Minute); err != nil {
@@ -47,90 +48,117 @@ func main() {
 		os.Exit(1)
 	}
 	defer s.shutdown()
-	authServer, err := s.startAuthListener()
+	listener, err := s.listenAPI()
 	if err != nil {
-		slog.Error("start authorization callback listener", "error", err)
+		slog.Error("start API listener", "error", err)
 		os.Exit(1)
 	}
-	defer authServer.Close()
+	defer listener.Close()
 
-	server := &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           s.routes(),
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		IdleTimeout:       60 * time.Second,
-	}
+	server := s.httpServer()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	slog.Info(
 		"trae-api listening",
-		"addr", cfg.Addr,
+		"addr", listener.Addr().String(),
 		"upstream", cfg.BaseURL,
 		"login", "run trae-api login",
 	)
 	serverErr := make(chan error, 1)
 	go func() {
-		serverErr <- server.ListenAndServe()
+		serverErr <- server.Serve(listener)
 	}()
 
-	select {
-	case err := <-serverErr:
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("http server stopped", "error", err)
-			s.shutdown()
-			os.Exit(1)
-		}
-	case <-ctx.Done():
-		slog.Info("shutdown signal received, draining...")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
-		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			slog.Error("graceful shutdown failed", "error", err)
-		}
+	if err := waitForHTTP(ctx, serverErr, func() error {
+		return s.shutdownHTTP(server, cfg.ShutdownTimeout)
+	}); err != nil {
+		slog.Error("http server stopped", "error", err)
 		s.shutdown()
+		os.Exit(1)
 	}
 }
 
-// parseFlags parses command-line flags with the standard flag package. It
-// returns (exitCode, true) when the flags were handled and the program should
-// exit, and (0, false) when execution should continue. All runtime
-// configuration comes from TRAE_API_* environment variables; the command line
-// offers login, -h/--help and -version.
-func parseFlags(args []string, stdout, stderr io.Writer) (int, bool) {
+func waitForHTTP(ctx context.Context, serverErr <-chan error, shutdown func() error) error {
+	select {
+	case err := <-serverErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+	case <-ctx.Done():
+		slog.Info("shutdown signal received, draining...")
+		shutdownErr := shutdown()
+		serveErr := <-serverErr
+		if errors.Is(serveErr, http.ErrServerClosed) {
+			serveErr = nil
+		}
+		if shutdownErr != nil {
+			return fmt.Errorf("graceful shutdown failed: %w", errors.Join(shutdownErr, serveErr))
+		}
+		return serveErr
+	}
+	return nil
+}
+
+type commandAction uint8
+
+const (
+	commandServe commandAction = iota
+	commandLogin
+	commandExit
+)
+
+// parseCommand dispatches once, then lets each command's FlagSet parse flags.
+// Exit codes are 0 for help/version, 2 for invalid arguments.
+func parseCommand(args []string, stdout, stderr io.Writer) (commandAction, int) {
+	action := commandServe
+	name := "trae-api"
 	if len(args) > 0 && args[0] == "login" {
-		if len(args) == 1 {
-			return 0, false
-		}
-		if len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
-			fmt.Fprintln(stdout, "Usage: trae-api login\nLog in to the running service via official browser authorization (10 minute timeout).\nUse the same TRAE_API_ADDR and TRAE_API_TOKEN as the service. Ctrl+C cancels.")
-			return 0, true
-		}
-		fmt.Fprintln(stderr, "login accepts no additional arguments")
-		return 2, true
+		action = commandLogin
+		name = "trae-api login"
+		args = args[1:]
 	}
-	fs := flag.NewFlagSet("trae-api", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	fs.Usage = func() { writeUsage(fs, stdout) }
-	showVersion := fs.Bool("version", false, "print version and exit")
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	fs.Usage = func() {}
+	var showVersion *bool
+	if action == commandServe {
+		showVersion = fs.Bool("version", false, "print version and exit")
+	}
+	usage := func(w io.Writer) {
+		if action == commandLogin {
+			writeLoginUsage(w)
+		} else {
+			writeUsage(fs, w)
+		}
+	}
 	if err := fs.Parse(args); err != nil {
-		// -h/--help: flag already ran Usage, which prints to stdout; exit 0.
 		if errors.Is(err, flag.ErrHelp) {
-			return 0, true
+			usage(stdout)
+			return commandExit, 0
 		}
-		return 2, true
-	}
-	if *showVersion {
-		fmt.Fprintf(stdout, "trae-api %s\n", version)
-		return 0, true
+		fmt.Fprintln(stderr, err)
+		usage(stderr)
+		return commandExit, 2
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "unknown command; use trae-api or trae-api login")
-		return 2, true
+		if action == commandLogin {
+			fmt.Fprintln(stderr, "login accepts no additional arguments")
+		} else {
+			fmt.Fprintln(stderr, "unknown command; use trae-api or trae-api login")
+		}
+		return commandExit, 2
 	}
-	return 0, false
+	if action == commandServe && *showVersion {
+		fmt.Fprintf(stdout, "trae-api %s\n", version)
+		return commandExit, 0
+	}
+	return action, 0
+}
+
+func writeLoginUsage(w io.Writer) {
+	fmt.Fprintln(w, "Usage: trae-api login\nLog in to the running service via official browser authorization (10 minute timeout).\nUse the same TRAE_API_ADDR and TRAE_API_TOKEN as the service. Ctrl+C cancels.")
 }
 
 func writeUsage(fs *flag.FlagSet, w io.Writer) {
@@ -146,12 +174,14 @@ Configuration is read from TRAE_API_* environment variables; see the
 project README for the full list. Highlights:
 
   TRAE_API_ADDR          listen address (default 127.0.0.1:8723)
-  TRAE_API_TOKEN         API token, required when binding a non-loopback address
-  Authorization callback is fixed at 127.0.0.1:8765.
+  TRAE_API_TOKEN         API token, required for wildcard remote listening
+  Use 0.0.0.0 or [::] with a token for remote access; single-interface non-loopback binds are unsupported.
+  Authorization callback uses the API listener port on loopback.
   Credentials exist only in memory; restart requires login again.
 
 Flags:
 `, version)
+	fs.SetOutput(w)
 	fs.PrintDefaults()
 }
 
@@ -169,9 +199,9 @@ func setupLogger(debug bool) {
 // Only Addr and APIToken are user configuration. Other fields are internal
 // protocol constants/test seams, not environment-configurable options.
 type config struct {
-	Addr            string
-	APIToken        string
-	AuthAddr        string
+	Addr     string
+	APIToken string
+
 	BaseURL         string
 	AuthBaseURL     string
 	AuthURL         string
@@ -186,8 +216,8 @@ type config struct {
 
 func defaultConfig() config {
 	return config{
-		Addr:            "127.0.0.1:8723",
-		AuthAddr:        "127.0.0.1:8765",
+		Addr: "127.0.0.1:8723",
+
 		BaseURL:         "https://trae-api-cn.mchost.guru",
 		AuthBaseURL:     "https://api.trae.cn",
 		AuthURL:         "https://www.trae.cn/authorization",
@@ -220,11 +250,11 @@ func loadConfig() (config, error) {
 	if host != "" && host != "localhost" && net.ParseIP(host) == nil {
 		return c, fmt.Errorf("TRAE_API_ADDR must use localhost or a literal IP")
 	}
+	if ip := net.ParseIP(host); ip != nil && !ip.IsLoopback() && !ip.IsUnspecified() {
+		return c, fmt.Errorf("TRAE_API_ADDR cannot bind a single non-loopback interface with one browser callback; use 0.0.0.0 or [::] with TRAE_API_TOKEN for remote access")
+	}
 	if !isLoopbackAddr(c.Addr) && c.APIToken == "" {
 		return c, fmt.Errorf("TRAE_API_TOKEN is required for non-loopback listening")
-	}
-	if n == 8765 {
-		return c, fmt.Errorf("TRAE_API_ADDR conflicts with the fixed authorization port 8765")
 	}
 	return c, nil
 }
@@ -273,6 +303,59 @@ func newServer(cfg config) (*server, error) {
 		auth: auth,
 	}
 	return s, nil
+}
+
+// listenAPI binds once; the browser callback must point to this very listener.
+// A loopback callback cannot be served by an explicitly non-loopback bind.
+func (s *server) listenAPI() (net.Listener, error) {
+	listener, err := net.Listen("tcp", s.cfg.Addr)
+	if err != nil {
+		return nil, err
+	}
+	ipAddr, ok := listener.Addr().(*net.TCPAddr)
+	if !ok {
+		listener.Close()
+		return nil, errors.New("API listener is not TCP")
+	}
+	ip := ipAddr.IP
+	switch {
+	case ip.IsLoopback():
+	case ip.IsUnspecified() && ip.To4() != nil:
+		ip = net.IPv4(127, 0, 0, 1)
+	case ip.IsUnspecified():
+		ip = net.IPv6loopback
+	default:
+		listener.Close()
+		return nil, errors.New("single-listener browser callback requires loopback or wildcard API address; use 0.0.0.0 or [::] with TRAE_API_TOKEN for remote access")
+	}
+	callbackURL := "http://" + net.JoinHostPort(ip.String(), strconv.Itoa(ipAddr.Port)) + "/authorize"
+	s.auth.mu.Lock()
+	s.auth.callbackURL = callbackURL
+	s.auth.mu.Unlock()
+	return listener, nil
+}
+
+func (s *server) httpServer() *http.Server {
+	return &http.Server{
+		Handler:           s.routes(),
+		BaseContext:       func(net.Listener) context.Context { return s.ctx },
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    128 << 10,
+	}
+}
+
+func (s *server) shutdownHTTP(server *http.Server, timeout time.Duration) error {
+	// Cancel streams and callbacks before waiting for active requests to drain.
+	s.shutdown()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		_ = server.Close()
+		return err
+	}
+	return nil
 }
 func acquireGate(ctx context.Context, gate chan struct{}, timeout time.Duration) error {
 	if err := ctx.Err(); err != nil {
