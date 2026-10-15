@@ -52,7 +52,8 @@ func TestTRAE003LoginCommandParsing(t *testing.T) {
 		},
 	} {
 		out, errOut := &bytes.Buffer{}, &bytes.Buffer{}
-		code, stop := parseFlags(tc.args, out, errOut)
+		action, code := parseCommand(tc.args, out, errOut)
+		stop := action == commandExit
 		if code != tc.code || stop != tc.stop || !strings.Contains(out.String(), tc.output) {
 			t.Fatalf("args=%v code=%d stop=%v output=%s", tc.args, code, stop, out)
 		}
@@ -204,11 +205,6 @@ func TestTRAE003LoginCommandServiceUnavailable(t *testing.T) {
 }
 
 func TestTRAE003BinaryRestartAndLegacyFiles(t *testing.T) {
-	probe, err := net.Listen("tcp", "127.0.0.1:8765")
-	if err != nil {
-		t.Skip("fixed authorization port is occupied")
-	}
-	probe.Close()
 	home := t.TempDir()
 	legacy := filepath.Join(home, ".local", "state", "trae-api")
 	os.MkdirAll(filepath.Join(legacy, "conversations-v2"), 0700)
@@ -309,7 +305,7 @@ func TestTRAE003BinaryRestartAndLegacyFiles(t *testing.T) {
 		t.Fatal("no attempt")
 	}
 	q := url.Values{"loginTraceID": {id}, "userJwt": {`{"Token":"synthetic-current-token"}`}, "userInfo": {`{"UserID":"fixture"}`}}
-	r, err = client.Get("http://127.0.0.1:8765/authorize?" + q.Encode())
+	r, err = client.Get(base + "/authorize?" + q.Encode())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -410,7 +406,7 @@ func TestParseFlags(t *testing.T) {
 			[]string{"--wat"},
 			true,
 			2,
-			"TRAE_API_ADDR",
+			"",
 			"flag provided but not defined: -wat",
 		},
 		{
@@ -418,16 +414,17 @@ func TestParseFlags(t *testing.T) {
 			[]string{"-x=1"},
 			true,
 			2,
-			"TRAE_API_ADDR",
+			"",
 			"flag provided but not defined: -x",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
-			code, stop := parseFlags(tt.args, stdout, stderr)
+			action, code := parseCommand(tt.args, stdout, stderr)
+			stop := action == commandExit
 			if code != tt.wantCode || stop != tt.wantStop {
-				t.Fatalf("parseFlags(%q) = (%d, %v), want (%d, %v)", tt.args, code, stop, tt.wantCode, tt.wantStop)
+				t.Fatalf("parseCommand(%q) = (%v, %d), want (%v, %d)", tt.args, action, code, tt.wantStop, tt.wantCode)
 			}
 			if got := stdout.String(); !strings.Contains(got, tt.wantStdout) {
 				t.Errorf("stdout = %q, want substring %q", got, tt.wantStdout)

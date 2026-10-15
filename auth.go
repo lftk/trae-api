@@ -15,7 +15,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
-	"net"
+
 	"net/http"
 	"net/url"
 	"strconv"
@@ -268,6 +268,10 @@ func (a *authManager) callback(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(status)
 		fmt.Fprint(w, "<!doctype html><meta charset=utf-8><title>Trae 登录</title><p>"+text+"</p>")
 	}
+	if r.Context().Err() != nil {
+		fail(400, "授权请求已取消，请重新发起登录。")
+		return
+	}
 	if len(r.URL.RawQuery) > 65536 {
 		fail(400, "授权回调过大。")
 		return
@@ -358,7 +362,7 @@ func (a *authManager) callback(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	result = a.loginResults[state]
-	if p.generation != a.generation || a.latestLogin != state || result.Status != "pending" || !time.Now().Before(result.Expires) {
+	if r.Context().Err() != nil || p.generation != a.generation || a.latestLogin != state || result.Status != "pending" || !time.Now().Before(result.Expires) {
 		fail(400, "登录状态已改变，请重新登录。")
 		return
 	}
@@ -611,35 +615,6 @@ func jwtClaims(token string) map[string]any {
 	var m map[string]any
 	_ = json.Unmarshal(b, &m)
 	return m
-}
-func (s *server) startAuthListener() (*http.Server, error) {
-	listener, e := net.Listen("tcp", s.cfg.AuthAddr)
-	if e != nil {
-		return nil, e
-	}
-	s.auth.mu.Lock()
-	s.auth.callbackURL = "http://" + listener.Addr().String() + "/authorize"
-	s.auth.mu.Unlock()
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /authorize", func(w http.ResponseWriter, r *http.Request) {
-		// Browser authorization is a cross-site top-level redirect. Do not apply
-		// the management API's same-origin policy to this listener.
-		if !localManagementHost(r.Host) {
-			writeError(w, http.StatusForbidden, "non-local authorization callback Host denied")
-			return
-		}
-		s.auth.callback(w, r)
-	})
-	srv := &http.Server{
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       30 * time.Second,
-		MaxHeaderBytes:    128 << 10,
-	}
-	go func() { _ = srv.Serve(listener) }()
-	return srv, nil
 }
 
 // A rejected token may have no usable expiry claim. Only an HTTP authentication

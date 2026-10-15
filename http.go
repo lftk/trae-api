@@ -245,7 +245,27 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/auth/login", s.startLogin)
 	mux.HandleFunc("POST /api/auth/login/status", s.loginStatus)
 	mux.HandleFunc("POST /api/auth/login/cancel", s.cancelLogin)
-	return authMiddleware(s.cfg.APIToken, mux)
+	mux.HandleFunc("GET /authorize", s.auth.callback)
+	protected := authMiddleware(s.cfg.APIToken, mux)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The official browser redirect has no API token and is cross-site.
+		// Exempt only this exact GET path, on the listener's loopback address
+		// and from a loopback TCP peer. All other routes retain API auth.
+		if r.Method == http.MethodGet && r.URL.EscapedPath() == "/authorize" {
+			s.auth.mu.Lock()
+			callbackURL := s.auth.callbackURL
+			s.auth.mu.Unlock()
+			callback, err := url.Parse(callbackURL)
+			peer, _, peerErr := net.SplitHostPort(r.RemoteAddr)
+			if err != nil || callback.Host == "" || r.Host != callback.Host || !localManagementHost(r.Host) || peerErr != nil || !net.ParseIP(peer).IsLoopback() {
+				writeError(w, http.StatusForbidden, "non-local authorization callback denied")
+				return
+			}
+			mux.ServeHTTP(w, r)
+			return
+		}
+		protected.ServeHTTP(w, r)
+	})
 }
 func authMiddleware(token string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
