@@ -1,6 +1,8 @@
 # trae-api
 
-单账号 Trae CN → OpenAI Chat Completions 网关。凭证仅在内存，对话无状态；不执行客户端工具。
+单账号 Trae CN → OpenAI Chat Completions 网关。API 与 Auth 独立运行，默认在同一进程协调启动；Auth 维护固定凭证文件，API 只读访问快照。对话无状态，不执行客户端工具。
+
+> 当前为按用户指示合并的开发快照，独立复核未通过。刷新取消和发送前栅栏写失败仍有已知边界问题，见 [已知问题](docs/KNOWN_ISSUES.md)；不得把合并或测试绿灯当作验收通过。
 
 ## 启动
 
@@ -8,20 +10,26 @@ Go 1.25+，在仓库根目录：
 
 ```bash
 go build -o trae-api .
-./trae-api             # 终端一：前台服务，默认 127.0.0.1:8723
-./trae-api login       # 终端二：为运行中的服务打开官方授权页
+./trae-api             # 同进程启动 API :8723 与 loopback Auth :8765
+./trae-api login       # 另一个终端：联系 Auth 打开官方授权页
+./trae-api api         # 或只启动 API
+./trae-api auth        # 或只启动 Auth
+./trae-api --help
+./trae-api login --help
 ```
 
-授权回调与 API 共用一个 HTTP 服务和 `TRAE_API_ADDR` 的监听端口，不再单独监听 8765。默认回调为本机 `127.0.0.1:8723/authorize`；改变 API 端口时回调随之改变。`login` CLI 仍连接正在运行的服务并打开官方授权页；帮助用 `./trae-api -help` 和 `./trae-api login -help`。登录等待最多十分钟；CLI 取得本次 attempt ID 后，取消或超时会尝试定向撤销。若首个响应丢失，CLI 无法得知 ID，残留尝试最多十分钟有效；已取消、过期或被替换的回调不能安装凭证。服务重启后须重新登录，CLI 不会偷偷启动服务。浏览器打开失败时可手动打开命令打印的官方授权链接；不打印带凭证的回调。Homebrew 服务种子见 [安装说明](packaging/homebrew-tap/README.md)，已发布版本不一定包含当前源码。
+命令分发、参数、帮助和版本由 `urfave/cli/v3` 处理。API 默认 `127.0.0.1:8723`，Auth 默认 `127.0.0.1:8765`；回调使用 Auth 实际绑定的 loopback 地址，不通过 API。CLI 不偷偷启动后台服务；Auth 从自己写出的有效凭证状态恢复，过期、失效或刷新状态不确定时可能需要重新登录。尚未发布安装包，不保证旧 Homebrew 包含当前源码行为。
 
 ## 配置
 
-仅支持两个环境变量（服务与 login 使用相同配置）：
+参数由 CLI 库读取，以各子命令 `--help` 为准：
 
-- `TRAE_API_ADDR`：默认 `127.0.0.1:8723`，API 与回调共用实际绑定端口；8765 是普通可用端口。单机使用回环地址；远程访问使用 `0.0.0.0:端口` 或 `[::]:端口` 通配监听并设置 Token。显式绑定单个非回环 IP 会报错并提示改用通配监听；此地址策略已纳入本轮最终方案。
-- `TRAE_API_TOKEN`：默认空；设置后所有 API 和管理请求需 `Authorization: Bearer <gateway-token>`。login 自动从环境变量读取并发送，不打印该值。
+- `--api-addr` / `TRAE_API_ADDR`：API 地址，默认 `127.0.0.1:8723`，非回环监听必须配置网关 Token。
+- `--auth-addr` / `TRAE_API_AUTH_ADDR`：Auth 地址，默认 `127.0.0.1:8765`，只允许 loopback；也供 login 使用。
+- `--api-token`：网关 Token 参数；真实秘密优先从 `TRAE_API_TOKEN` 环境变量读取，避免出现在进程参数中。
+- `TRAE_API_TOKEN`：默认空；设置后 API 请求需 `Authorization: Bearer <gateway-token>`。login 只联系本机 Auth，不发送此网关 Token。
 
-其他 `TRAE_API_*` 变量会报错。模型/认证协议地址、客户端版本、并发和超时不开放配置。无 Token 的 API 路由仅接受本机 Host 和同源请求；有 Token 的 API 与登录管理接口仍需 Bearer。只有精确的 `GET /authorize` 回调允许官方跨站浏览器跳转且不携带 API Token，仍须本机来源和有效的一次性授权尝试；其它路径不享有例外。通配监听下回调仍使用实际绑定端口的本机回环地址，不通过远程地址或请求头生成；IPv6 可用性须以运行环境和后端验收结果为准。
+网关访问 Token 与 auth.json 中的 Trae 上游凭证不同。API 不再提供 Auth 管理或回调路由；Auth 独立检查 loopback Host/来源、管理请求同源和一次性授权。浏览器回调不携带网关 Token。模型/认证协议地址、客户端版本、并发和超时不开放配置。
 
 ## 接入
 
@@ -36,13 +44,13 @@ curl http://127.0.0.1:8723/v1/chat/completions \
   -d '{"model":"auto","messages":[{"role":"user","content":"你好"}],"stream":true}'
 ```
 
-设置 Token 时另加 Bearer 头。**每次请求传完整 `messages` 历史和所需 `tools`**；网关不保存历史，`X-Session-ID` 等头不续接会话。客户端自行执行工具，将助手 `tool_calls` 及每个匹配 ID 的 `role=tool` 结果放入后续完整历史；网关不执行或伪造工具结果。`reasoning_content` 仅保证输出，输入推理历史不保证保真。支持文本和函数工具；图片、托管工具、结构化输出、可调 reasoning 参数等不支持。认证拒绝且未输出时最多续期重试一次；网络/业务失败或已输出请求不重放。
+设置 Token 时另加 Bearer 头。**每次请求传完整 messages 和所需 tools**；工具由客户端执行并回传匹配 ID 的结果，网关不保存历史、不执行工具。reasoning_content 仅保证输出。图片、托管工具、结构化输出、可调 reasoning 参数等不支持。API 对上游鉴权拒绝不续期或重放；续期由独立 Auth 负责。
 
 **本机离线接入演示**：[examples/README.md](examples/README.md)（Python 标准库 + 本地 mock，含流式、推理字段、工具调用和错误场景）。
 
-## 不落盘与旧版本迁移
+## 凭证文件与旧数据
 
-凭证、刷新令牌仅在当前进程内存，历史完全由客户端提供。服务不读取、写入、恢复或清理任何 credential.json、sessions、conversations-v2 文件；不接触旧版本留下的文件。移除旧配置不会删除旧数据，请由用户自行管理。
+Auth 唯一写入 `filepath.Join(os.UserConfigDir(), "trae-api", "auth.json")`，目录 0700、文件 0600。文件包含敏感凭证及续期状态，不要提交或分享。API 逐请求只读访问 Token、有效期及必要标识；续期仅在 Auth 中发生。原子更新、重启恢复和故障限制见 [凭证契约](docs/CREDENTIALS.md)。测试必须隔离配置目录，macOS 需独立 HOME。既有 credential/history/session 文件及备份不自动迁移或清理，对话仍不落盘。
 
 ## 开发验证
 

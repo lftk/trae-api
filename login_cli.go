@@ -16,13 +16,7 @@ import (
 )
 
 func loginAddress(c config) string {
-	h, p, _ := net.SplitHostPort(c.Addr)
-	if h == "" || h == "0.0.0.0" {
-		h = "127.0.0.1"
-	}
-	if h == "::" {
-		h = "::1"
-	}
+	h, p, _ := net.SplitHostPort(c.AuthAddr)
 	return "http://" + net.JoinHostPort(h, p)
 }
 func openOfficialBrowser(ctx context.Context, link string) error {
@@ -52,19 +46,17 @@ func loginCall(ctx context.Context, client *http.Client, c config, path string, 
 		return nil, errors.New("invalid service address")
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if c.APIToken != "" {
-		req.Header.Set("Authorization", "Bearer "+c.APIToken)
-	}
+
 	resp, err := client.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, errors.New("service is not running or unavailable; start trae-api first")
+		return nil, errors.New("Auth service is not running or unavailable; start trae-api auth first")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		return nil, errors.New("gateway authentication failed; check TRAE_API_TOKEN and service address")
+		return nil, errors.New("Auth service rejected the login request; check the local Auth address")
 	}
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("login request failed (HTTP %d)", resp.StatusCode)
@@ -76,31 +68,15 @@ func loginCall(ctx context.Context, client *http.Client, c config, path string, 
 	return result, nil
 }
 func localLoginTarget(c config) bool {
-	host, _, err := net.SplitHostPort(c.Addr)
+	host, _, err := net.SplitHostPort(c.AuthAddr)
 	if err != nil {
 		return false
 	}
-	if host == "" || host == "localhost" || host == "0.0.0.0" || host == "::" {
+	if host == "localhost" {
 		return true
 	}
 	target := net.ParseIP(host)
-	if target == nil {
-		return false
-	}
-	if target.IsLoopback() {
-		return true
-	}
-	addresses, err := net.InterfaceAddrs()
-	if err != nil {
-		return false
-	}
-	for _, address := range addresses {
-		ip, _, err := net.ParseCIDR(address.String())
-		if err == nil && ip.Equal(target) {
-			return true
-		}
-	}
-	return false
+	return target != nil && target.IsLoopback()
 }
 func runLogin(parent context.Context, c config, out io.Writer, open func(context.Context, string) error, poll, timeout time.Duration) error {
 	if !localLoginTarget(c) {
@@ -159,8 +135,10 @@ func runLogin(parent context.Context, c config, out io.Writer, open func(context
 			}
 			switch state["status"] {
 			case "completed":
-				fmt.Fprintln(out, "Login successful. Credentials remain in service memory.")
+				fmt.Fprintln(out, "Login successful. Auth saved credentials in the user config directory.")
 				return nil
+			case "durability_uncertain":
+				return errors.New("credential is usable now, but disk durability is unconfirmed; repeat login before restarting Auth")
 			case "pending":
 			case "cancelled":
 				return errors.New("login cancelled")

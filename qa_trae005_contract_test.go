@@ -61,12 +61,17 @@ func TestQA005ModelDiscoveryWireNullsAndFallback(t *testing.T) {
 	cfg.BaseURL = upstream.URL
 	server := authenticatedServer(t, cfg)
 	defer server.shutdown()
-	cred, generation := server.auth.snapshot()
+	cred, err := readAPICredential()
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := snapshotIdentity(cred)
+	server.upstream.cache = nil // Exercise discovery, not the helper's seeded explicit route.
 	names, err := server.upstream.modelNames(context.Background(), cred, generation)
 	if err != nil || strings.Join(names, ",") != "a,z,z-max" || batchCalls != 1 || detailCalls != 4 {
 		t.Fatalf("discovery changed: names=%v err=%v batch=%d detail=%d", names, err, batchCalls, detailCalls)
 	}
-	route := server.upstream.routes["z-max"]
+	route := server.upstream.cache[generation].routes["z-max"]
 	if route.function != "chat_v3" || route.base != "z" || route.name != "z__max" || route.most != 1024 || route.window != 4096 {
 		t.Fatalf("max metadata changed: %+v", route)
 	}

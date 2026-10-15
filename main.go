@@ -3,16 +3,16 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
+
 	"fmt"
-	"io"
+
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
+
 	"sync"
 	"syscall"
 	"time"
@@ -23,42 +23,28 @@ import (
 var version = "dev"
 
 func main() {
-	action, code := parseCommand(os.Args[1:], os.Stdout, os.Stderr)
-	if action == commandExit {
-		os.Exit(code)
-	}
-	cfg, err := loadConfig()
-	if err != nil {
-		slog.Error("load configuration", "error", err)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := newCommand().Run(ctx, os.Args); err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	if action == commandLogin {
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-		defer stop()
-		if err := runLogin(ctx, cfg, os.Stdout, openOfficialBrowser, 500*time.Millisecond, 10*time.Minute); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		return
-	}
+}
+
+func runCurrent(ctx context.Context, cfg config) error {
 	setupLogger(false)
 	s, err := newServer(cfg)
 	if err != nil {
-		slog.Error("initialize service", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("initialize service: %w", err)
 	}
 	defer s.shutdown()
 	listener, err := s.listenAPI()
 	if err != nil {
-		slog.Error("start API listener", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("start API listener: %w", err)
 	}
 	defer listener.Close()
 
 	server := s.httpServer()
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	slog.Info(
 		"trae-api listening",
@@ -74,10 +60,9 @@ func main() {
 	if err := waitForHTTP(ctx, serverErr, func() error {
 		return s.shutdownHTTP(server, cfg.ShutdownTimeout)
 	}); err != nil {
-		slog.Error("http server stopped", "error", err)
-		s.shutdown()
-		os.Exit(1)
+		return fmt.Errorf("http server stopped: %w", err)
 	}
+	return nil
 }
 
 func waitForHTTP(ctx context.Context, serverErr <-chan error, shutdown func() error) error {
@@ -101,90 +86,6 @@ func waitForHTTP(ctx context.Context, serverErr <-chan error, shutdown func() er
 	return nil
 }
 
-type commandAction uint8
-
-const (
-	commandServe commandAction = iota
-	commandLogin
-	commandExit
-)
-
-// parseCommand dispatches once, then lets each command's FlagSet parse flags.
-// Exit codes are 0 for help/version, 2 for invalid arguments.
-func parseCommand(args []string, stdout, stderr io.Writer) (commandAction, int) {
-	action := commandServe
-	name := "trae-api"
-	if len(args) > 0 && args[0] == "login" {
-		action = commandLogin
-		name = "trae-api login"
-		args = args[1:]
-	}
-	fs := flag.NewFlagSet(name, flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	fs.Usage = func() {}
-	var showVersion *bool
-	if action == commandServe {
-		showVersion = fs.Bool("version", false, "print version and exit")
-	}
-	usage := func(w io.Writer) {
-		if action == commandLogin {
-			writeLoginUsage(w)
-		} else {
-			writeUsage(fs, w)
-		}
-	}
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			usage(stdout)
-			return commandExit, 0
-		}
-		fmt.Fprintln(stderr, err)
-		usage(stderr)
-		return commandExit, 2
-	}
-	if fs.NArg() != 0 {
-		if action == commandLogin {
-			fmt.Fprintln(stderr, "login accepts no additional arguments")
-		} else {
-			fmt.Fprintln(stderr, "unknown command; use trae-api or trae-api login")
-		}
-		return commandExit, 2
-	}
-	if action == commandServe && *showVersion {
-		fmt.Fprintf(stdout, "trae-api %s\n", version)
-		return commandExit, 0
-	}
-	return action, 0
-}
-
-func writeLoginUsage(w io.Writer) {
-	fmt.Fprintln(w, "Usage: trae-api login\nLog in to the running service via official browser authorization (10 minute timeout).\nUse the same TRAE_API_ADDR and TRAE_API_TOKEN as the service. Ctrl+C cancels.")
-}
-
-func writeUsage(fs *flag.FlagSet, w io.Writer) {
-	fmt.Fprintf(w, `trae-api %s
-
-OpenAI-compatible HTTP gateway for Trae CN (direct HTTP).
-
-Usage:
-  trae-api [flags]        Start the API service
-  trae-api login          Log in to the running service
-
-Configuration is read from TRAE_API_* environment variables; see the
-project README for the full list. Highlights:
-
-  TRAE_API_ADDR          listen address (default 127.0.0.1:8723)
-  TRAE_API_TOKEN         API token, required for wildcard remote listening
-  Use 0.0.0.0 or [::] with a token for remote access; single-interface non-loopback binds are unsupported.
-  Authorization callback uses the API listener port on loopback.
-  Credentials exist only in memory; restart requires login again.
-
-Flags:
-`, version)
-	fs.SetOutput(w)
-	fs.PrintDefaults()
-}
-
 func setupLogger(debug bool) {
 	level := new(slog.LevelVar)
 	level.Set(slog.LevelInfo)
@@ -200,6 +101,7 @@ func setupLogger(debug bool) {
 // protocol constants/test seams, not environment-configurable options.
 type config struct {
 	Addr     string
+	AuthAddr string
 	APIToken string
 
 	BaseURL         string
@@ -216,7 +118,8 @@ type config struct {
 
 func defaultConfig() config {
 	return config{
-		Addr: "127.0.0.1:8723",
+		Addr:     "127.0.0.1:8723",
+		AuthAddr: "127.0.0.1:8765",
 
 		BaseURL:         "https://trae-api-cn.mchost.guru",
 		AuthBaseURL:     "https://api.trae.cn",
@@ -230,42 +133,28 @@ func defaultConfig() config {
 		ShutdownTimeout: 30 * time.Second,
 	}
 }
-func loadConfig() (config, error) {
-	c := defaultConfig()
-	for _, entry := range os.Environ() {
-		key, _, _ := strings.Cut(entry, "=")
-		if strings.HasPrefix(key, "TRAE_API_") && key != "TRAE_API_ADDR" && key != "TRAE_API_TOKEN" {
-			return c, fmt.Errorf("%s is unsupported; only TRAE_API_ADDR and TRAE_API_TOKEN are supported", key)
-		}
-	}
-	if addr := os.Getenv("TRAE_API_ADDR"); addr != "" {
-		c.Addr = addr
-	}
-	c.APIToken = os.Getenv("TRAE_API_TOKEN")
-	host, port, err := net.SplitHostPort(c.Addr)
-	n, e := strconv.Atoi(port)
-	if err != nil || e != nil || n < 1 || n > 65535 {
-		return c, fmt.Errorf("TRAE_API_ADDR must be host:port with port 1..65535")
-	}
-	if host != "" && host != "localhost" && net.ParseIP(host) == nil {
-		return c, fmt.Errorf("TRAE_API_ADDR must use localhost or a literal IP")
-	}
-	if ip := net.ParseIP(host); ip != nil && !ip.IsLoopback() && !ip.IsUnspecified() {
-		return c, fmt.Errorf("TRAE_API_ADDR cannot bind a single non-loopback interface with one browser callback; use 0.0.0.0 or [::] with TRAE_API_TOKEN for remote access")
-	}
-	if !isLoopbackAddr(c.Addr) && c.APIToken == "" {
-		return c, fmt.Errorf("TRAE_API_TOKEN is required for non-loopback listening")
-	}
-	return c, nil
-}
 func isLoopbackAddr(addr string) bool {
 	h, _, err := net.SplitHostPort(addr)
 	return err == nil && (h == "localhost" || net.ParseIP(h).IsLoopback())
 }
 
+func validateAPIConfig(c config) error {
+	host, port, err := net.SplitHostPort(c.Addr)
+	n, parseErr := strconv.Atoi(port)
+	if err != nil || parseErr != nil || n < 0 || n > 65535 {
+		return errors.New("API address must be host:port with port 0..65535")
+	}
+	if host != "" && host != "localhost" && net.ParseIP(host) == nil {
+		return errors.New("API address must use localhost or a literal IP")
+	}
+	if !isLoopbackAddr(c.Addr) && c.APIToken == "" {
+		return errors.New("TRAE_API_TOKEN is required for non-loopback listening")
+	}
+	return nil
+}
+
 type server struct {
 	cfg      config
-	auth     *authManager
 	upstream *traeClient
 	slots    chan struct{}
 	ctx      context.Context
@@ -285,14 +174,9 @@ func badRequest(s string) error {
 	}
 }
 func newServer(cfg config) (*server, error) {
-	auth, err := newAuthManager(cfg)
-	if err != nil {
-		return nil, err
-	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &server{
 		cfg:    cfg,
-		auth:   auth,
 		slots:  make(chan struct{}, cfg.MaxConcurrent),
 		ctx:    ctx,
 		cancel: cancel,
@@ -300,38 +184,19 @@ func newServer(cfg config) (*server, error) {
 	s.upstream = &traeClient{
 		cfg:  cfg,
 		http: newHTTPClient(cfg.RequestTimeout),
-		auth: auth,
 	}
 	return s, nil
 }
 
-// listenAPI binds once; the browser callback must point to this very listener.
-// A loopback callback cannot be served by an explicitly non-loopback bind.
+// listenAPI binds the API only; Auth owns its own loopback callback listener.
 func (s *server) listenAPI() (net.Listener, error) {
+	if err := validateAPIConfig(s.cfg); err != nil {
+		return nil, err
+	}
 	listener, err := net.Listen("tcp", s.cfg.Addr)
 	if err != nil {
 		return nil, err
 	}
-	ipAddr, ok := listener.Addr().(*net.TCPAddr)
-	if !ok {
-		listener.Close()
-		return nil, errors.New("API listener is not TCP")
-	}
-	ip := ipAddr.IP
-	switch {
-	case ip.IsLoopback():
-	case ip.IsUnspecified() && ip.To4() != nil:
-		ip = net.IPv4(127, 0, 0, 1)
-	case ip.IsUnspecified():
-		ip = net.IPv6loopback
-	default:
-		listener.Close()
-		return nil, errors.New("single-listener browser callback requires loopback or wildcard API address; use 0.0.0.0 or [::] with TRAE_API_TOKEN for remote access")
-	}
-	callbackURL := "http://" + net.JoinHostPort(ip.String(), strconv.Itoa(ipAddr.Port)) + "/authorize"
-	s.auth.mu.Lock()
-	s.auth.callbackURL = callbackURL
-	s.auth.mu.Unlock()
 	return listener, nil
 }
 
@@ -393,10 +258,12 @@ func (s *server) execute(ctx context.Context, r chatRequest, emit func(delta) er
 		return r, completion{}, err
 	}
 	defer func() { <-s.slots }()
-	c, g, err := s.auth.get(ctx)
+	snapshot, err := readAPICredential()
 	if err != nil {
 		return r, completion{}, err
 	}
+	g := snapshotIdentity(snapshot)
+	c := snapshot
 	if r.Model == "" || r.Model == "auto" {
 		models, e := s.upstream.modelNames(ctx, c, g)
 		if e != nil {
@@ -409,14 +276,7 @@ func (s *server) execute(ctx context.Context, r chatRequest, emit func(delta) er
 	if _, err := s.upstream.resolveRoute(ctx, c, g, r.Model); err != nil {
 		return r, completion{}, err
 	}
-	latest, latestGeneration, err := s.auth.get(ctx)
-	if err != nil {
-		return r, completion{}, err
-	}
-	if latestGeneration != g {
-		return r, completion{}, errLoginRequired
-	}
-	c = latest
+
 	if emit != nil {
 		if err = emit(delta{
 			Start: true,
@@ -428,16 +288,13 @@ func (s *server) execute(ctx context.Context, r chatRequest, emit func(delta) er
 	started := time.Now()
 	result, err := s.upstream.prompt(ctx, c, g, r, newID("request_"), emit)
 	slog.Debug("Trae request finished", "model", r.Model, "elapsed", time.Since(started), "success", err == nil)
-	if err == nil && !s.auth.validGeneration(g) {
-		err = errLoginRequired
-	}
 	return r, result, err
 }
 func (s *server) shutdown() {
 	s.stopOnce.Do(func() {
 		s.cancel()
 		s.upstream.http.CloseIdleConnections()
-		s.auth.client.CloseIdleConnections()
+
 	})
 }
 func statusForError(err error) int {

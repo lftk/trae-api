@@ -211,6 +211,62 @@ func TestQA006RequestBodyLimitBoundary(t *testing.T) {
 	}
 }
 
+func TestQA006FullToolHistoryReachesWireWithoutExecution(t *testing.T) {
+	wires := make(chan map[string]any, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		wires <- body
+		fmt.Fprint(w, textFrames("answer"))
+	}))
+	defer upstream.Close()
+	cfg := fixtureConfig()
+	cfg.BaseURL = upstream.URL
+	s := authenticatedServer(t, cfg)
+	for _, stream := range []bool{false, true} {
+		body := fmt.Sprintf(`{"model":"m","messages":[{"role":"user","content":"read"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","function":{"name":"read_file","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_1","content":"synthetic caller result"},{"role":"user","content":"summarize"}],"tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}}],"stream":%t}`, stream)
+		r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8723/v1/chat/completions", strings.NewReader(body))
+		w := httptest.NewRecorder()
+		s.routes().ServeHTTP(w, r)
+		if w.Code != http.StatusOK || (stream && !strings.Contains(w.Body.String(), "data: [DONE]")) || (!stream && !strings.Contains(w.Body.String(), `"content":"answer"`)) {
+			t.Fatalf("stream=%t status=%d response=%q", stream, w.Code, w.Body.String())
+		}
+		select {
+		case wire := <-wires:
+			messages, ok := wire["messages"].([]any)
+			if !ok || len(messages) != 5 {
+				t.Fatalf("stream=%t tool instruction/history missing: %v", stream, wire["messages"])
+			}
+			instruction, ok := messages[0].(map[string]any)
+			if !ok || instruction["role"] != "system" || !strings.Contains(jsonText(instruction["content"]), "Tools belong to the API caller") {
+				t.Fatalf("stream=%t caller-owned tool instruction changed: %v", stream, instruction)
+			}
+			tools, ok := wire["tools"].([]any)
+			if !ok || len(tools) != 1 || !strings.Contains(jsonText(tools[0]), `"parameters":"{\"type\":\"object\"}"`) || wire["tool_choice"] != "auto" {
+				t.Fatalf("stream=%t tool schema/choice missing: %v", stream, wire["tools"])
+			}
+			assistant, ok := messages[2].(map[string]any)
+			if !ok || assistant["role"] != "assistant" || assistant["content"] != nil {
+				t.Fatalf("stream=%t assistant tool call changed: %v", stream, assistant)
+			}
+			calls, ok := assistant["tool_calls"].([]any)
+			if !ok || len(calls) != 1 || !strings.Contains(jsonText(calls[0]), `"id":"call_1"`) || !strings.Contains(jsonText(calls[0]), `"name":"read_file"`) {
+				t.Fatalf("stream=%t tool call identity lost: %v", stream, calls)
+			}
+			toolResult, ok := messages[3].(map[string]any)
+			if !ok || toolResult["role"] != "tool" || toolResult["tool_call_id"] != "call_1" || !strings.Contains(jsonText(toolResult), "synthetic caller result") {
+				t.Fatalf("stream=%t caller result changed: %v", stream, toolResult)
+			}
+		default:
+			t.Fatalf("stream=%t no tool-history request observed", stream)
+		}
+	}
+}
+
 func TestQA006AcceptedInputsReachUpstreamWireInBothModes(t *testing.T) {
 	type observed struct {
 		body          map[string]any
@@ -267,62 +323,6 @@ func TestQA006AcceptedInputsReachUpstreamWireInBothModes(t *testing.T) {
 			}
 		default:
 			t.Fatalf("stream=%t no upstream request observed", stream)
-		}
-	}
-}
-
-func TestQA006FullToolHistoryReachesWireWithoutExecution(t *testing.T) {
-	wires := make(chan map[string]any, 2)
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Error(err)
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		wires <- body
-		fmt.Fprint(w, textFrames("answer"))
-	}))
-	defer upstream.Close()
-	cfg := fixtureConfig()
-	cfg.BaseURL = upstream.URL
-	s := authenticatedServer(t, cfg)
-	for _, stream := range []bool{false, true} {
-		body := fmt.Sprintf(`{"model":"m","messages":[{"role":"user","content":"read"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","function":{"name":"read_file","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_1","content":"synthetic caller result"},{"role":"user","content":"summarize"}],"tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}}],"stream":%t}`, stream)
-		r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8723/v1/chat/completions", strings.NewReader(body))
-		w := httptest.NewRecorder()
-		s.routes().ServeHTTP(w, r)
-		if w.Code != http.StatusOK || (stream && !strings.Contains(w.Body.String(), "data: [DONE]")) || (!stream && !strings.Contains(w.Body.String(), `"content":"answer"`)) {
-			t.Fatalf("stream=%t status=%d response=%q", stream, w.Code, w.Body.String())
-		}
-		select {
-		case wire := <-wires:
-			messages, ok := wire["messages"].([]any)
-			if !ok || len(messages) != 5 {
-				t.Fatalf("stream=%t tool instruction/history missing: %v", stream, wire["messages"])
-			}
-			instruction, ok := messages[0].(map[string]any)
-			if !ok || instruction["role"] != "system" || !strings.Contains(jsonText(instruction["content"]), "Tools belong to the API caller") {
-				t.Fatalf("stream=%t caller-owned tool instruction changed: %v", stream, instruction)
-			}
-			tools, ok := wire["tools"].([]any)
-			if !ok || len(tools) != 1 || !strings.Contains(jsonText(tools[0]), `"parameters":"{\"type\":\"object\"}"`) || wire["tool_choice"] != "auto" {
-				t.Fatalf("stream=%t tool schema/choice missing: %v", stream, wire["tools"])
-			}
-			assistant, ok := messages[2].(map[string]any)
-			if !ok || assistant["role"] != "assistant" || assistant["content"] != nil {
-				t.Fatalf("stream=%t assistant tool call changed: %v", stream, assistant)
-			}
-			calls, ok := assistant["tool_calls"].([]any)
-			if !ok || len(calls) != 1 || !strings.Contains(jsonText(calls[0]), `"id":"call_1"`) || !strings.Contains(jsonText(calls[0]), `"name":"read_file"`) {
-				t.Fatalf("stream=%t tool call identity lost: %v", stream, calls)
-			}
-			toolResult, ok := messages[3].(map[string]any)
-			if !ok || toolResult["role"] != "tool" || toolResult["tool_call_id"] != "call_1" || !strings.Contains(jsonText(toolResult), "synthetic caller result") {
-				t.Fatalf("stream=%t caller result changed: %v", stream, toolResult)
-			}
-		default:
-			t.Fatalf("stream=%t no tool-history request observed", stream)
 		}
 	}
 }

@@ -201,12 +201,12 @@ func chatChunk(id string, created int64, model string, d openai.ChatCompletionCh
 	}
 }
 func (s *server) models(w http.ResponseWriter, r *http.Request) {
-	c, g, e := s.auth.get(r.Context())
+	c, e := readAPICredential()
 	if e != nil {
 		writeError(w, statusForError(e), e.Error())
 		return
 	}
-	names, e := s.upstream.modelNames(r.Context(), c, g)
+	names, e := s.upstream.modelNames(r.Context(), c, snapshotIdentity(c))
 	if e != nil {
 		writeError(w, statusForError(e), e.Error())
 		return
@@ -220,12 +220,6 @@ func (s *server) models(w http.ResponseWriter, r *http.Request) {
 			OwnedBy: "trae",
 		})
 	}
-	s.auth.mu.Lock()
-	defer s.auth.mu.Unlock()
-	if s.auth.generation != g || s.auth.cred.Token == "" {
-		writeError(w, 401, errLoginRequired.Error())
-		return
-	}
 	writeJSON(w, 200, pagination.Page[openai.Model]{
 		Object: "list",
 		Data:   models,
@@ -234,38 +228,15 @@ func (s *server) models(w http.ResponseWriter, r *http.Request) {
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		c, _ := s.auth.snapshot()
-		writeJSON(w, 200, map[string]any{"status": "ok", "logged_in": c.Token != ""})
+		_, err := readAPICredential()
+		writeJSON(w, 200, map[string]any{"status": "ok", "logged_in": err == nil})
 	})
 	mux.HandleFunc("GET /v1/models", s.models)
 	mux.HandleFunc("POST /v1/chat/completions", s.chat)
 	mux.HandleFunc("/v1/responses", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 501, "Responses API is unsupported; use Chat Completions with full history")
 	})
-	mux.HandleFunc("POST /api/auth/login", s.startLogin)
-	mux.HandleFunc("POST /api/auth/login/status", s.loginStatus)
-	mux.HandleFunc("POST /api/auth/login/cancel", s.cancelLogin)
-	mux.HandleFunc("GET /authorize", s.auth.callback)
-	protected := authMiddleware(s.cfg.APIToken, mux)
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// The official browser redirect has no API token and is cross-site.
-		// Exempt only this exact GET path, on the listener's loopback address
-		// and from a loopback TCP peer. All other routes retain API auth.
-		if r.Method == http.MethodGet && r.URL.EscapedPath() == "/authorize" {
-			s.auth.mu.Lock()
-			callbackURL := s.auth.callbackURL
-			s.auth.mu.Unlock()
-			callback, err := url.Parse(callbackURL)
-			peer, _, peerErr := net.SplitHostPort(r.RemoteAddr)
-			if err != nil || callback.Host == "" || r.Host != callback.Host || !localManagementHost(r.Host) || peerErr != nil || !net.ParseIP(peer).IsLoopback() {
-				writeError(w, http.StatusForbidden, "non-local authorization callback denied")
-				return
-			}
-			mux.ServeHTTP(w, r)
-			return
-		}
-		protected.ServeHTTP(w, r)
-	})
+	return authMiddleware(s.cfg.APIToken, mux)
 }
 func authMiddleware(token string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -274,13 +245,6 @@ func authMiddleware(token string, next http.Handler) http.Handler {
 			return
 		}
 		valid := token == "" || subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+token)) == 1
-		if !valid && (strings.HasPrefix(r.URL.Path, "/web/") || strings.HasPrefix(r.URL.Path, "/api/auth/")) {
-			_, password, ok := r.BasicAuth()
-			valid = ok && subtle.ConstantTimeCompare([]byte(password), []byte(token)) == 1
-			if !valid {
-				w.Header().Set("WWW-Authenticate", `Basic realm="trae-api login"`)
-			}
-		}
 		if !valid {
 			writeError(w, 401, "invalid API token")
 			return
@@ -335,12 +299,20 @@ func writeError(w http.ResponseWriter, status int, detail string) {
 }
 func (s *server) writeExecutionError(w http.ResponseWriter, sink *streamSink, e error) {
 	if sink != nil && sink.hasStarted() {
+		typ := "server_error"
+		if statusForError(e) == http.StatusUnauthorized {
+			typ = "authentication_error"
+		}
 		_ = sink.send("", openAIErrorJSON{
 			detail: openai.Error{
 				Message: e.Error(),
-				Type:    "server_error",
+				Type:    typ,
 			},
 		})
+		if typ == "authentication_error" {
+			sink.finish()
+			return
+		}
 		_ = sink.done()
 		return
 	}

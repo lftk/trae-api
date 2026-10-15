@@ -8,8 +8,8 @@ brew services start trae-api
 trae-api login
 ```
 
-服务启动后在同一台电脑运行 login，打开官方浏览器授权；不再使用本地登录网页。服务重启需重新登录。
+默认服务同时运行 API 与 Auth；在同一台电脑运行 login 联系 Auth 并打开官方授权。Auth 可恢复自己写出的固定凭证文件，不再要求每次重启登录；失效或刷新不确定时可能需要重新授权。
 
-只支持 `TRAE_API_ADDR` 和 `TRAE_API_TOKEN`。Formula 不注入任何状态目录；凭证和对话不落盘，旧文件保持不动。升级前从旧 LaunchAgent/启动环境移除其他 TRAE_API_* 变量，否则启动会明确报错。本仓库不会替用户修改 LaunchAgent、系统环境或删除旧数据。
+源码通过 cli 参数及环境来源配置 API 地址、Auth 地址和网关访问 Token，详见项目 README。Auth 将敏感状态持久化到固定用户配置目录，对话不落盘。Formula 不注入自定义状态目录；本仓库不会修改用户的 LaunchAgent、系统环境或清理旧数据。
 
-授权回调与 API 共用 `TRAE_API_ADDR` 端口，8765 不再单独保留。单个非回环 IP 的拒绝策略已纳入本轮地址方案，独立 QA 对提交 `b33ac385` 的技术复测通过；但尚未发布，旧版本安装不等于具备单端口能力。服务日志默认写入 Homebrew 日志目录，日志不含凭证或完整回调 URL。Formula 仍是发布占位，真实账号登录与模型调用未验证。
+当前源码默认 API 127.0.0.1:8723、Auth 127.0.0.1:8765，配置和固定 auth.json 的权限要求以项目 README 为准。Formula 仍是发布占位，旧安装包不保证包含此架构。当前开发快照独立复核未通过，见 ../../docs/KNOWN_ISSUES.md；真实账号登录、模型调用未验证。日志不得含凭证或完整回调 URL。

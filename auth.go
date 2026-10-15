@@ -33,6 +33,7 @@ type credential struct {
 	ClientID         string            `json:"client_id"`
 	ExpiresAt        time.Time         `json:"expires_at"`
 	RefreshExpiresAt time.Time         `json:"refresh_expires_at"`
+	RefreshPending   bool              `json:"refresh_pending"`
 	DeviceID         string            `json:"device_id"`
 	MachineID        string            `json:"machine_id"`
 	DeviceKey        *ecdsa.PrivateKey `json:"-"`
@@ -49,18 +50,20 @@ type loginResult struct {
 	Expires time.Time
 }
 type authManager struct {
-	mu           sync.Mutex
-	cfg          config
-	client       *http.Client
-	cred         credential
-	generation   uint64
-	refreshing   chan struct{}
-	refreshErr   error
-	pending      map[string]loginAttempt
-	callbackURL  string
-	latestLogin  string
-	loginResults map[string]loginResult
-	refreshedAt  time.Time
+	mu                  sync.Mutex
+	cfg                 config
+	client              *http.Client
+	cred                credential
+	generation          uint64
+	refreshing          chan struct{}
+	refreshErr          error
+	durabilityUncertain bool
+	pending             map[string]loginAttempt
+	callbackURL         string
+	latestLogin         string
+	loginResults        map[string]loginResult
+	refreshedAt         time.Time
+	store               *credentialStore
 }
 
 func newHTTPClient(timeout time.Duration) *http.Client {
@@ -85,15 +88,20 @@ func (a *authManager) snapshot() (credential, uint64) {
 	defer a.mu.Unlock()
 	return a.cred, a.generation
 }
-func (a *authManager) validGeneration(g uint64) bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.generation == g && a.cred.Token != ""
-}
+
 func (a *authManager) get(ctx context.Context) (credential, uint64, error) {
 	for {
 		a.mu.Lock()
-		if a.cred.Token == "" || a.refreshErr != nil {
+		if a.cred.Token == "" {
+			a.mu.Unlock()
+			return credential{}, 0, errLoginRequired
+		}
+		if a.refreshErr != nil {
+			if errors.Is(a.refreshErr, errAmbiguousExchange) && !a.cred.ExpiresAt.IsZero() && time.Now().Before(a.cred.ExpiresAt) {
+				c, g := a.cred, a.generation
+				a.mu.Unlock()
+				return c, g, nil
+			}
 			a.mu.Unlock()
 			return credential{}, 0, errLoginRequired
 		}
@@ -113,6 +121,20 @@ func (a *authManager) get(ctx context.Context) (credential, uint64, error) {
 			}
 		}
 		old, g := a.cred, a.generation
+		if a.store != nil {
+			pending := old
+			pending.RefreshPending = true
+			if err := a.store.Save(pending); err != nil {
+				a.refreshedAt = time.Now()
+				a.mu.Unlock()
+				if !old.ExpiresAt.IsZero() && time.Now().Before(old.ExpiresAt) {
+					return old, g, nil
+				}
+				return credential{}, 0, fmt.Errorf("prepare refresh state: %w", err)
+			}
+			old = pending
+			a.cred.RefreshPending = true
+		}
 		done := make(chan struct{})
 		a.refreshing = done
 		a.mu.Unlock()
@@ -120,13 +142,53 @@ func (a *authManager) get(ctx context.Context) (credential, uint64, error) {
 		a.mu.Lock()
 		changed := a.generation != g
 		usable := false
+		published := false
+		if !changed && ctx.Err() != nil {
+			e = ctx.Err()
+		}
 		if !changed {
 			if e == nil {
-				a.cred = fresh
-				a.refreshedAt = time.Now()
+				fresh.RefreshPending = false
+				if a.store != nil {
+					saveErr := a.store.Save(fresh)
+					published, e = a.reconcilePublished(fresh, saveErr)
+				} else {
+					published = true
+				}
+				if published {
+					a.cred = fresh
+					a.refreshedAt = time.Now()
+					a.refreshErr = nil
+					a.durabilityUncertain = e != nil
+				} else {
+					a.refreshErr = errAmbiguousExchange
+					usable = !old.ExpiresAt.IsZero() && time.Now().Before(old.ExpiresAt)
+				}
 			} else if ctx.Err() == nil {
 				if errors.Is(e, errLoginRequired) {
+					// A definitive rejection must invalidate the API's disk snapshot too.
+					// Preserve the refresh material for a later login or inspection.
+					if a.store != nil {
+						invalid := old
+						invalid.ExpiresAt = time.Now().Add(-time.Second)
+						invalid.RefreshPending = false
+						if saveErr := a.store.Save(invalid); saveErr != nil {
+							if quarantineErr := a.store.QuarantineRejected(old.Token); quarantineErr != nil {
+								e = errors.Join(fmt.Errorf("invalidate rejected credential: %w", saveErr), fmt.Errorf("quarantine rejected credential: %w", quarantineErr))
+							}
+						}
+					}
+					a.refreshErr = errLoginRequired
+				} else if errors.Is(e, errAmbiguousExchange) {
+					// A successful but incomplete exchange may already have spent the
+					// one-use refresh token. Never send it again; keep valid access only.
 					a.refreshErr = e
+					usable = !old.ExpiresAt.IsZero() && time.Now().Before(old.ExpiresAt)
+				} else if a.store != nil {
+					// After an outbound refresh, connection and malformed-response
+					// failures cannot prove the one-use token was not spent.
+					a.refreshErr = errAmbiguousExchange
+					usable = !old.ExpiresAt.IsZero() && time.Now().Before(old.ExpiresAt)
 				} else if !old.ExpiresAt.IsZero() && time.Now().Before(old.ExpiresAt) {
 					// Proactive refresh is best effort. Back off briefly without
 					// poisoning a token that the upstream has not rejected.
@@ -145,6 +207,9 @@ func (a *authManager) get(ctx context.Context) (credential, uint64, error) {
 			if ctx.Err() != nil {
 				return credential{}, 0, ctx.Err()
 			}
+			if published {
+				return fresh, g, e
+			}
 			if usable {
 				return old, g, nil
 			}
@@ -152,13 +217,37 @@ func (a *authManager) get(ctx context.Context) (credential, uint64, error) {
 		}
 	}
 }
-func (a *authManager) invalidate(g uint64, rejectedToken string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.generation == g && a.cred.Token == rejectedToken {
-		a.refreshErr = errLoginRequired
+
+// Rename may succeed before directory sync reports an error. Only a complete
+// readback of this exchange may replace Auth's in-memory credential; the error
+// still reaches callers because on-disk durability is unconfirmed.
+func (a *authManager) reconcilePublished(c credential, saveErr error) (bool, error) {
+	if saveErr == nil {
+		return true, nil
 	}
+	disk, readErr := a.store.Load()
+	if readErr != nil {
+		return false, errors.Join(saveErr, fmt.Errorf("read back credential: %w", readErr))
+	}
+	if !sameCredential(disk, c) {
+		return false, errors.Join(saveErr, errors.New("published credential does not match exchange"))
+	}
+	return true, fmt.Errorf("credential visible but durability unconfirmed: %w", saveErr)
 }
+
+func sameCredential(a, b credential) bool {
+	return a.Token == b.Token &&
+		a.RefreshToken == b.RefreshToken &&
+		a.UserID == b.UserID &&
+		a.ClientID == b.ClientID &&
+		a.ExpiresAt.Equal(b.ExpiresAt) &&
+		a.RefreshExpiresAt.Equal(b.RefreshExpiresAt) &&
+		a.RefreshPending == b.RefreshPending &&
+		a.DeviceID == b.DeviceID &&
+		a.MachineID == b.MachineID &&
+		a.DeviceKey != nil && b.DeviceKey != nil && a.DeviceKey.Equal(b.DeviceKey)
+}
+
 func (a *authManager) logout() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -366,12 +455,30 @@ func (a *authManager) callback(w http.ResponseWriter, r *http.Request) {
 		fail(400, "登录状态已改变，请重新登录。")
 		return
 	}
+	var persistenceErr error
+	if a.store != nil {
+		saveErr := a.store.Save(c)
+		var published bool
+		published, persistenceErr = a.reconcilePublished(c, saveErr)
+		if !published {
+			fail(503, "凭证保存失败，请重新登录。")
+			return
+		}
+	}
 	a.cred = c
 	a.generation++
 	a.refreshErr = nil
+	a.durabilityUncertain = persistenceErr != nil
 	result = a.loginResults[state]
 	result.Status = "completed"
+	if persistenceErr != nil {
+		result.Status = "durability_uncertain"
+	}
 	a.loginResults[state] = result
+	if persistenceErr != nil {
+		fail(503, "凭证当前可用，但磁盘持久化未确认；重启前请重新登录。")
+		return
+	}
 	fmt.Fprint(w, "<!doctype html><html lang=zh-CN><meta charset=utf-8><title>Trae 登录成功</title><p>登录成功，可以关闭此页面并返回 trae-api。</p></html>")
 }
 func newDeviceID() (string, error) {
@@ -504,6 +611,9 @@ func (a *authManager) legacyExchange(ctx context.Context, c credential) (credent
 	}
 	return decodeExchange(resp, c)
 }
+
+var errAmbiguousExchange = errors.New("token exchange response missing access token")
+
 func decodeExchange(resp *http.Response, c credential) (credential, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
@@ -524,7 +634,7 @@ func decodeExchange(resp *http.Response, c credential) (credential, error) {
 	}
 	token := firstString(data, "Token", "token", "AccessToken", "accessToken")
 	if token == "" {
-		return c, errLoginRequired
+		return c, errAmbiguousExchange
 	}
 	c.Token = token
 	if v := firstString(data, "RefreshToken", "refreshToken"); v != "" {
@@ -617,29 +727,6 @@ func jwtClaims(token string) map[string]any {
 	return m
 }
 
-// A rejected token may have no usable expiry claim. Only an HTTP authentication
-// rejection (before any model output) permits a refresh and one new attempt.
-func (a *authManager) refreshRejected(ctx context.Context, token string, g uint64) (credential, uint64, error) {
-	a.mu.Lock()
-	if a.generation != g {
-		a.mu.Unlock()
-		return credential{}, 0, errLoginRequired
-	}
-	if a.cred.Token == token {
-		a.cred.ExpiresAt = time.Now().Add(-time.Second)
-	}
-	a.mu.Unlock()
-	c, current, err := a.get(ctx)
-	if err != nil {
-		return credential{}, 0, err
-	}
-	// Refresh must never transfer an in-flight request to a newly logged-in account.
-	if current != g || !a.validGeneration(g) {
-		return credential{}, 0, errLoginRequired
-	}
-	return c, current, nil
-}
-
 func (a *authManager) finishLogin(id string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -648,88 +735,4 @@ func (a *authManager) finishLogin(id string) {
 		result.Status = "failed"
 		a.loginResults[id] = result
 	}
-}
-func (s *server) startLogin(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "no-store")
-	if !sameOrigin(r) {
-		writeError(w, 403, "cross-origin management request denied")
-		return
-	}
-	s.auth.mu.Lock()
-	logged := s.auth.cred.Token != "" && s.auth.refreshErr == nil && (s.auth.cred.ExpiresAt.IsZero() || time.Now().Before(s.auth.cred.ExpiresAt))
-	s.auth.mu.Unlock()
-	if logged {
-		writeJSON(w, 200, map[string]string{"status": "already_logged_in"})
-		return
-	}
-	link, err := s.auth.beginLogin()
-	if err != nil {
-		writeError(w, 503, "authorization callback listener is unavailable")
-		return
-	}
-	u, _ := url.Parse(link)
-	writeJSON(w, 200, map[string]string{
-		"status":     "pending",
-		"url":        link,
-		"attempt_id": u.Query().Get("login_trace_id"),
-	})
-}
-func (s *server) cancelLogin(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "no-store")
-	if !sameOrigin(r) {
-		writeError(w, 403, "cross-origin management request denied")
-		return
-	}
-	body, _, err := decodeBody(w, r)
-	if err != nil {
-		writeError(w, 400, "invalid cancellation request")
-		return
-	}
-	id := firstString(objectValue(string(body)), "attempt_id")
-	s.auth.mu.Lock()
-	result, ok := s.auth.loginResults[id]
-	if ok && result.Status == "pending" {
-		result.Status = "cancelled"
-		s.auth.loginResults[id] = result
-		delete(s.auth.pending, id)
-		if s.auth.latestLogin == id {
-			s.auth.latestLogin = ""
-		}
-	}
-	s.auth.mu.Unlock()
-	if !ok {
-		writeError(w, 404, "login attempt not found")
-		return
-	}
-	writeJSON(w, 200, map[string]string{"status": result.Status})
-}
-
-func (s *server) loginStatus(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "no-store")
-	if !sameOrigin(r) {
-		writeError(w, 403, "cross-origin management request denied")
-		return
-	}
-	body, _, err := decodeBody(w, r)
-	if err != nil {
-		writeError(w, 400, "invalid login status request")
-		return
-	}
-	id := firstString(objectValue(string(body)), "attempt_id")
-	s.auth.mu.Lock()
-	result, ok := s.auth.loginResults[id]
-	if ok && result.Status == "pending" && time.Now().After(result.Expires) {
-		result.Status = "expired"
-		s.auth.loginResults[id] = result
-		delete(s.auth.pending, id)
-		if s.auth.latestLogin == id {
-			s.auth.latestLogin = ""
-		}
-	}
-	s.auth.mu.Unlock()
-	if !ok {
-		writeError(w, 404, "login attempt not found")
-		return
-	}
-	writeJSON(w, 200, map[string]string{"status": result.Status})
 }

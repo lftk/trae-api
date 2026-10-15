@@ -123,10 +123,11 @@ func buildRoutedIDEBody(r chatRequest, sessionID string, route modelRoute) map[s
 	return body
 }
 
-func (t *traeClient) resolveRoute(ctx context.Context, c credential, g uint64, model string) (modelRoute, error) {
+func (t *traeClient) resolveRoute(ctx context.Context, c apiCredential, g uint64, model string) (modelRoute, error) {
 	t.mu.Lock()
-	route, ok := t.routes[model]
-	valid := t.modelsGeneration == g && time.Since(t.modelsAt) < 5*time.Minute
+	cached := t.cache[g]
+	route, ok := cached.routes[model]
+	valid := time.Since(cached.at) < 5*time.Minute
 	t.mu.Unlock()
 	if !ok || !valid {
 		// Explicit models need their function and native model name too. Discovery
@@ -135,19 +136,16 @@ func (t *traeClient) resolveRoute(ctx context.Context, c credential, g uint64, m
 			return modelRoute{}, err
 		}
 		t.mu.Lock()
-		route, ok = t.routes[model]
+		route, ok = t.cache[g].routes[model]
 		t.mu.Unlock()
 		if !ok {
 			return modelRoute{}, badRequest("model is not available for this account")
 		}
 	}
-	if !t.auth.validGeneration(g) {
-		return modelRoute{}, errLoginRequired
-	}
 	return route, nil
 }
 
-func (t *traeClient) promptAttempt(ctx context.Context, c credential, g uint64, r chatRequest, id string, onDelta func(delta) error) (completion, error) {
+func (t *traeClient) promptAttempt(ctx context.Context, c apiCredential, g uint64, r chatRequest, id string, onDelta func(delta) error) (completion, error) {
 	route, err := t.resolveRoute(ctx, c, g, r.Model)
 	if err != nil {
 		return completion{}, err
@@ -338,14 +336,17 @@ func (a *ideAccumulator) frame(event, raw string) error {
 		return fmt.Errorf("invalid Trae SSE JSON")
 	}
 	if event == "" {
-		event = firstString(obj, "event", "event_type", "eventType", "type")
+		event = apiFirstString(obj, "event", "event_type", "eventType", "type")
 	}
 	kind := normalizeEvent(event)
+	if code := apiFirstString(obj, "code"); code != "" && code != "0" {
+		if code == "401" || code == "403" || code == "1001" {
+			return errCredentialRejected
+		}
+		return fmt.Errorf("Trae returned business error")
+	}
 	if kind == "error" || obj["error"] != nil {
 		return fmt.Errorf("Trae returned an error event")
-	}
-	if code, ok := obj["code"].(float64); ok && code != 0 {
-		return fmt.Errorf("Trae returned business error %d", int(code))
 	}
 	if kind == "heartbeat" || kind == "keepalive" || kind == "ping" {
 		return a.send(delta{
@@ -353,17 +354,17 @@ func (a *ideAccumulator) frame(event, raw string) error {
 		})
 	}
 	if kind == "tokenusage" {
-		v := objectValue(obj["usage"])
+		v := apiObjectValue(obj["usage"])
 		if v == nil {
 			v = obj
 		}
 		a.result.Usage = parseUsage(v)
 		return nil
 	}
-	if v := objectValue(obj["usage"]); v != nil {
+	if v := apiObjectValue(obj["usage"]); v != nil {
 		a.result.Usage = parseUsage(v)
 	}
-	if f := firstString(obj, "finish_reason", "finishReason", "stop_reason", "stopReason"); f != "" {
+	if f := apiFirstString(obj, "finish_reason", "finishReason", "stop_reason", "stopReason"); f != "" {
 		switch f {
 		case "length", "max_tokens":
 			a.result.Finish = "length"
@@ -371,14 +372,14 @@ func (a *ideAccumulator) frame(event, raw string) error {
 			a.result.Finish = "content_filter"
 		}
 	}
-	text := firstString(obj, "response", "text", "content")
-	reason := firstString(obj, "reasoning_content", "reasoningContent", "thought", "thinking")
-	if m := objectValue(obj["message"]); m != nil {
+	text := apiFirstString(obj, "response", "text", "content")
+	reason := apiFirstString(obj, "reasoning_content", "reasoningContent", "thought", "thinking")
+	if m := apiObjectValue(obj["message"]); m != nil {
 		if text == "" {
-			text = firstString(m, "content", "text")
+			text = apiFirstString(m, "content", "text")
 		}
 		if reason == "" {
-			reason = firstString(m, "reasoning_content", "reasoningContent", "thought", "thinking")
+			reason = apiFirstString(m, "reasoning_content", "reasoningContent", "thought", "thinking")
 		}
 	}
 	// Thinking embedded in a cumulative response is held until its closing tag.
@@ -414,7 +415,7 @@ func (a *ideAccumulator) frame(event, raw string) error {
 	if e := a.extractCalls(obj); e != nil {
 		return e
 	}
-	if m := objectValue(obj["message"]); m != nil {
+	if m := apiObjectValue(obj["message"]); m != nil {
 		if e := a.extractCalls(m); e != nil {
 			return e
 		}
@@ -438,7 +439,7 @@ func (a *ideAccumulator) extractCalls(obj map[string]any) error {
 			records = []any{v}
 		}
 		for i, raw := range records {
-			m := objectValue(raw)
+			m := apiObjectValue(raw)
 			if m == nil {
 				return fmt.Errorf("invalid Trae tool event")
 			}
@@ -458,21 +459,21 @@ func (a *ideAccumulator) extractCalls(obj map[string]any) error {
 }
 
 func (a *ideAccumulator) addCall(m map[string]any, fallback int) error {
-	fn := objectValue(m["function_call"])
+	fn := apiObjectValue(m["function_call"])
 	native := fn != nil
 	if fn == nil {
-		fn = objectValue(m["functionCall"])
+		fn = apiObjectValue(m["functionCall"])
 		native = fn != nil
 	}
 	if fn == nil {
-		fn = objectValue(m["function"])
+		fn = apiObjectValue(m["function"])
 	}
 	if fn == nil {
 		fn = m
 	}
-	name := firstString(fn, "name")
+	name := apiFirstString(fn, "name")
 	if name == "" {
-		name = firstString(m, "name", "tool_name")
+		name = apiFirstString(m, "name", "tool_name")
 	}
 	if name == "finish" || name == "done" || name == "final" {
 		found := false
@@ -490,9 +491,9 @@ func (a *ideAccumulator) addCall(m map[string]any, fallback int) error {
 		}
 		index = int(v)
 	}
-	id := firstString(m, "id", "tool_call_id", "toolCallId")
+	id := apiFirstString(m, "id", "tool_call_id", "toolCallId")
 	if id == "" {
-		id = firstString(fn, "id", "toolCallId")
+		id = apiFirstString(fn, "id", "toolCallId")
 	}
 	slot, exists := a.byID[id]
 	if indexed, ok := a.byIndex[index]; index >= 0 && ok {
@@ -637,21 +638,9 @@ func parseUsage(m map[string]any) *usage {
 
 var errCredentialRejected = errors.New("upstream rejected credential")
 
-func (t *traeClient) prompt(ctx context.Context, c credential, g uint64, r chatRequest, id string, onDelta func(delta) error) (completion, error) {
+func (t *traeClient) prompt(ctx context.Context, c apiCredential, g uint64, r chatRequest, id string, onDelta func(delta) error) (completion, error) {
 	result, e := t.promptAttempt(ctx, c, g, r, id, onDelta)
 	if errors.Is(e, errCredentialRejected) {
-		fresh, newGeneration, err := t.auth.refreshRejected(ctx, c.Token, g)
-		if err != nil {
-			return result, err
-		}
-		if newGeneration != g || !t.auth.validGeneration(g) {
-			return result, errLoginRequired
-		}
-		c, g = fresh, newGeneration
-		result, e = t.promptAttempt(ctx, c, g, r, id, onDelta)
-	}
-	if errors.Is(e, errCredentialRejected) {
-		t.auth.invalidate(g, c.Token)
 		return result, errLoginRequired
 	}
 	return result, e
