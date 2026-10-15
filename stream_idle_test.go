@@ -26,7 +26,9 @@ func TestTRAE003IdleSSEDeadlineRenewal(t *testing.T) {
 		_ = s.done()
 	}))
 	defer up.Close()
-	c := &http.Client{Timeout: 40 * time.Second}
+	c := &http.Client{
+		Timeout: 40 * time.Second,
+	}
 	resp, err := c.Get(up.URL)
 	if err != nil {
 		t.Fatal(err)

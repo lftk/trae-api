@@ -29,7 +29,13 @@ func TestTRAE003OldRejectionCannotInvalidateNewToken(t *testing.T) {
 	s := authenticatedServer(t, cfg)
 	a = s.auth
 	a.cred.RefreshToken = "synthetic-refresh"
-	_, _, err := s.execute(context.Background(), chatRequest{Model: "m", Messages: []message{{Role: "user", Content: "hi"}}}, nil)
+	_, _, err := s.execute(context.Background(), chatRequest{
+		Model: "m",
+		Messages: []message{{
+			Role:    "user",
+			Content: "hi",
+		}},
+	}, nil)
 	if err != errLoginRequired {
 		t.Fatalf("expected rejected request: %v", err)
 	}

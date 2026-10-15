@@ -157,5 +157,7 @@ func setupLogger(debug bool) {
 	if debug {
 		level.Set(slog.LevelDebug)
 	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: level,
+	})))
 }

@@ -16,7 +16,12 @@ import (
 
 func TestOfficialSDKChatCompatibility(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, frame("output", map[string]any{"reasoning_content": "check", "tool_calls": []any{map[string]any{"id": "call_read", "function_call": map[string]string{"name": "read_file", "args": `{"path":"README.md"}`}}}})+frame("done", map[string]any{"finish_reason": "tool_calls", "usage": map[string]any{"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15, "cached_tokens": 2}}))
+		fmt.Fprint(w, frame("output", map[string]any{"reasoning_content": "check", "tool_calls": []any{map[string]any{"id": "call_read", "function_call": map[string]string{"name": "read_file", "args": `{"path":"README.md"}`}}}})+frame("done", map[string]any{"finish_reason": "tool_calls", "usage": map[string]any{
+			"prompt_tokens":     12,
+			"completion_tokens": 3,
+			"total_tokens":      15,
+			"cached_tokens":     2,
+		}}))
 	}))
 	defer up.Close()
 	cfg := fixtureConfig()
@@ -90,7 +95,10 @@ func TestChatUsesSDKDefaultJSON(t *testing.T) {
 	cfg.BaseURL = up.URL
 	s := authenticatedServer(t, cfg)
 	for _, stream := range []bool{false, true} {
-		w := callAPI(t, s, "/v1/chat/completions", map[string]any{"model": "m", "messages": []message{{Role: "user", Content: "hi"}}, "stream": stream, "stream_options": map[string]bool{"include_usage": true}}, "")
+		w := callAPI(t, s, "/v1/chat/completions", map[string]any{"model": "m", "messages": []message{{
+			Role:    "user",
+			Content: "hi",
+		}}, "stream": stream, "stream_options": map[string]bool{"include_usage": true}}, "")
 		if w.Code != 200 {
 			t.Fatal(w.Code, w.Body.String())
 		}
@@ -161,7 +169,9 @@ func TestOfficialSDKErrorCompatibility(t *testing.T) {
 	api := httptest.NewServer(s.routes())
 	defer api.Close()
 	client := openai.NewClient(option.WithBaseURL(api.URL+"/v1/"), option.WithAPIKey("test"), option.WithMaxRetries(0))
-	_, err := client.Chat.Completions.New(context.Background(), openai.ChatCompletionNewParams{Model: "m"})
+	_, err := client.Chat.Completions.New(context.Background(), openai.ChatCompletionNewParams{
+		Model: "m",
+	})
 	var apiError *openai.Error
 	if !errors.As(err, &apiError) || apiError.StatusCode != 400 || apiError.Type != "invalid_request_error" || apiError.Message == "" {
 		t.Fatalf("unexpected SDK error: %v", err)

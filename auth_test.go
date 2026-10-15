@@ -35,7 +35,11 @@ func TestLoginInvalidStateAndFailedRefresh(t *testing.T) {
 	fail := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `{"Result":{}}`) }))
 	defer fail.Close()
 	a.cfg.AuthBaseURL = fail.URL
-	a.cred = credential{Token: "expired", RefreshToken: "refresh", ExpiresAt: time.Now().Add(-time.Second)}
+	a.cred = credential{
+		Token:        "expired",
+		RefreshToken: "refresh",
+		ExpiresAt:    time.Now().Add(-time.Second),
+	}
 	if _, _, e := a.get(context.Background()); e != errLoginRequired {
 		t.Fatal(e)
 	}
@@ -54,9 +58,16 @@ func TestLogoutDuringRefreshCannotRestoreCredential(t *testing.T) {
 	cfg := fixtureConfig()
 	cfg.AuthBaseURL = up.URL
 	a, _ := newAuthManager(cfg)
-	a.cred = credential{Token: "old", RefreshToken: "refresh", ExpiresAt: time.Now().Add(-time.Second)}
+	a.cred = credential{
+		Token:        "old",
+		RefreshToken: "refresh",
+		ExpiresAt:    time.Now().Add(-time.Second),
+	}
 	done := make(chan error, 1)
-	go func() { _, _, e := a.get(context.Background()); done <- e }()
+	go func() {
+		_, _, e := a.get(context.Background())
+		done <- e
+	}()
 	<-started
 	if e := a.logout(); e != nil {
 		t.Fatal(e)
@@ -92,7 +103,13 @@ func TestAuthenticationRejectionRefreshesOnceBeforeModelOutput(t *testing.T) {
 	s.auth.mu.Lock()
 	s.auth.cred.RefreshToken = "refresh"
 	s.auth.mu.Unlock()
-	_, c, e := s.execute(context.Background(), chatRequest{Model: "m", Messages: []message{{Role: "user", Content: "hi"}}}, nil)
+	_, c, e := s.execute(context.Background(), chatRequest{
+		Model: "m",
+		Messages: []message{{
+			Role:    "user",
+			Content: "hi",
+		}},
+	}, nil)
 	if e != nil || c.Message.Content != "ok" || attempts.Load() != 2 || refreshes.Load() != 1 {
 		t.Fatalf("%+v %v attempts=%d refreshes=%d", c, e, attempts.Load(), refreshes.Load())
 	}

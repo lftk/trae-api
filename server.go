@@ -23,15 +23,30 @@ type apiError struct {
 }
 
 func (e *apiError) Error() string { return e.message }
-func badRequest(s string) error   { return &apiError{400, s} }
+func badRequest(s string) error {
+	return &apiError{
+		400,
+		s,
+	}
+}
 func newServer(cfg config) (*server, error) {
 	auth, err := newAuthManager(cfg)
 	if err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &server{cfg: cfg, auth: auth, slots: make(chan struct{}, cfg.MaxConcurrent), ctx: ctx, cancel: cancel}
-	s.upstream = &traeClient{cfg: cfg, http: newHTTPClient(cfg.RequestTimeout), auth: auth}
+	s := &server{
+		cfg:    cfg,
+		auth:   auth,
+		slots:  make(chan struct{}, cfg.MaxConcurrent),
+		ctx:    ctx,
+		cancel: cancel,
+	}
+	s.upstream = &traeClient{
+		cfg:  cfg,
+		http: newHTTPClient(cfg.RequestTimeout),
+		auth: auth,
+	}
 	return s, nil
 }
 func acquireGate(ctx context.Context, gate chan struct{}, timeout time.Duration) error {
@@ -46,7 +61,10 @@ func acquireGate(ctx context.Context, gate chan struct{}, timeout time.Duration)
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-timer.C:
-		return &apiError{503, "request queue timed out"}
+		return &apiError{
+			503,
+			"request queue timed out",
+		}
 	}
 }
 func (s *server) execute(ctx context.Context, r chatRequest, emit func(delta) error) (chatRequest, completion, error) {
@@ -92,7 +110,11 @@ func (s *server) execute(ctx context.Context, r chatRequest, emit func(delta) er
 	}
 	c = latest
 	if emit != nil {
-		if err = emit(delta{Start: true, Model: r.Model, Tools: r.Tools}); err != nil {
+		if err = emit(delta{
+			Start: true,
+			Model: r.Model,
+			Tools: r.Tools,
+		}); err != nil {
 			return r, completion{}, err
 		}
 	}
@@ -105,7 +127,11 @@ func (s *server) execute(ctx context.Context, r chatRequest, emit func(delta) er
 	return r, result, err
 }
 func (s *server) shutdown() {
-	s.stopOnce.Do(func() { s.cancel(); s.upstream.http.CloseIdleConnections(); s.auth.client.CloseIdleConnections() })
+	s.stopOnce.Do(func() {
+		s.cancel()
+		s.upstream.http.CloseIdleConnections()
+		s.auth.client.CloseIdleConnections()
+	})
 }
 func statusForError(err error) int {
 	var ae *apiError

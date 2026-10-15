@@ -10,20 +10,29 @@ func TestTRAE001ToolIdentity(t *testing.T) {
 		name    string
 		records []map[string]any
 	}{
-		{"separate IDs without indices", []map[string]any{
-			{"id": "a", "function_call": map[string]string{"name": "read_file", "arguments": "{}"}},
-			{"id": "b", "function_call": map[string]string{"name": "read_file", "arguments": "{}"}},
-		}},
-		{"ID acquires index", []map[string]any{
-			{"id": "a", "function_call": map[string]string{"name": "read_file", "arguments": "{"}},
-			{"id": "a", "index": 7, "function_call": map[string]string{"arguments": ""}},
-			{"index": 7, "function_call": map[string]string{"arguments": "}"}},
-		}},
-		{"unindexed continuation follows latest", []map[string]any{
-			{"index": 0, "id": "a", "function_call": map[string]string{"name": "read_file", "arguments": "{}"}},
-			{"index": 1, "id": "b", "function_call": map[string]string{"name": "read_file", "arguments": "{"}},
-			{"function_call": map[string]string{"arguments": "}"}},
-		}},
+		{
+			"separate IDs without indices",
+			[]map[string]any{
+				{"id": "a", "function_call": map[string]string{"name": "read_file", "arguments": "{}"}},
+				{"id": "b", "function_call": map[string]string{"name": "read_file", "arguments": "{}"}},
+			},
+		},
+		{
+			"ID acquires index",
+			[]map[string]any{
+				{"id": "a", "function_call": map[string]string{"name": "read_file", "arguments": "{"}},
+				{"id": "a", "index": 7, "function_call": map[string]string{"arguments": ""}},
+				{"index": 7, "function_call": map[string]string{"arguments": "}"}},
+			},
+		},
+		{
+			"unindexed continuation follows latest",
+			[]map[string]any{
+				{"index": 0, "id": "a", "function_call": map[string]string{"name": "read_file", "arguments": "{}"}},
+				{"index": 1, "id": "b", "function_call": map[string]string{"name": "read_file", "arguments": "{"}},
+				{"function_call": map[string]string{"arguments": "}"}},
+			},
+		},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			wire := ""
@@ -32,7 +41,13 @@ func TestTRAE001ToolIdentity(t *testing.T) {
 			}
 			wire += frame("done", map[string]any{})
 			var streamed []delta
-			result, err := readIDEStream(strings.NewReader(wire), chatRequest{Tools: []tool{fileTool()}, Choice: "auto"}, func(d delta) error { streamed = append(streamed, d); return nil })
+			result, err := readIDEStream(strings.NewReader(wire), chatRequest{
+				Tools:  []tool{fileTool()},
+				Choice: "auto",
+			}, func(d delta) error {
+				streamed = append(streamed, d)
+				return nil
+			})
 			if err != nil {
 				t.Fatal(err)
 			}

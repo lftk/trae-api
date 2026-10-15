@@ -45,7 +45,13 @@ func (m *message) UnmarshalJSON(b []byte) error {
 			v.ToolCalls[i].Type = "function"
 		}
 	}
-	*m = message{Role: v.Role, Content: text, ToolCalls: v.ToolCalls, ToolCallID: v.ToolCallID, Name: v.Name}
+	*m = message{
+		Role:       v.Role,
+		Content:    text,
+		ToolCalls:  v.ToolCalls,
+		ToolCallID: v.ToolCallID,
+		Name:       v.Name,
+	}
 	return nil
 }
 func textContent(raw json.RawMessage) (string, error) {
@@ -118,13 +124,14 @@ type completion struct {
 	Finish    string
 }
 type delta struct {
-	Text, Reasoning string
-	Call            *toolCall
-	Index           int
-	Heartbeat       bool
-	Start           bool
-	Model           string
-	Tools           []tool
+	Text      string
+	Reasoning string
+	Call      *toolCall
+	Index     int
+	Heartbeat bool
+	Start     bool
+	Model     string
+	Tools     []tool
 }
 
 func newID(prefix string) string {
@@ -134,7 +141,10 @@ func newID(prefix string) string {
 	}
 	return prefix + hex.EncodeToString(b[:])
 }
-func jsonText(v any) string { b, _ := json.Marshal(v); return string(b) }
+func jsonText(v any) string {
+	b, _ := json.Marshal(v)
+	return string(b)
+}
 func choiceName(raw json.RawMessage, tools []tool) (string, error) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return "auto", nil

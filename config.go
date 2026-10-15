@@ -12,14 +12,36 @@ import (
 // Only Addr and APIToken are user configuration. Other fields are internal
 // protocol constants/test seams, not environment-configurable options.
 type config struct {
-	Addr, APIToken                                                                string
-	AuthAddr, BaseURL, AuthBaseURL, AuthURL, ClientID, IDEVersion, IDEVersionCode string
-	MaxConcurrent                                                                 int
-	QueueTimeout, RequestTimeout, ShutdownTimeout                                 time.Duration
+	Addr            string
+	APIToken        string
+	AuthAddr        string
+	BaseURL         string
+	AuthBaseURL     string
+	AuthURL         string
+	ClientID        string
+	IDEVersion      string
+	IDEVersionCode  string
+	MaxConcurrent   int
+	QueueTimeout    time.Duration
+	RequestTimeout  time.Duration
+	ShutdownTimeout time.Duration
 }
 
 func defaultConfig() config {
-	return config{Addr: "127.0.0.1:8723", AuthAddr: "127.0.0.1:8765", BaseURL: "https://trae-api-cn.mchost.guru", AuthBaseURL: "https://api.trae.cn", AuthURL: "https://www.trae.cn/authorization", ClientID: "ono9krqynydwx5", IDEVersion: "3.3.65", IDEVersionCode: "20260401", MaxConcurrent: 2, QueueTimeout: time.Minute, RequestTimeout: 5 * time.Minute, ShutdownTimeout: 30 * time.Second}
+	return config{
+		Addr:            "127.0.0.1:8723",
+		AuthAddr:        "127.0.0.1:8765",
+		BaseURL:         "https://trae-api-cn.mchost.guru",
+		AuthBaseURL:     "https://api.trae.cn",
+		AuthURL:         "https://www.trae.cn/authorization",
+		ClientID:        "ono9krqynydwx5",
+		IDEVersion:      "3.3.65",
+		IDEVersionCode:  "20260401",
+		MaxConcurrent:   2,
+		QueueTimeout:    time.Minute,
+		RequestTimeout:  5 * time.Minute,
+		ShutdownTimeout: 30 * time.Second,
+	}
 }
 func loadConfig() (config, error) {
 	c := defaultConfig()

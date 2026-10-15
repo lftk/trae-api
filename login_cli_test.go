@@ -50,7 +50,10 @@ func TestTRAE003CLIWaitAndFallback(t *testing.T) {
 				t.Fatal("fallback URL missing")
 			}
 			out.Reset()
-			err = runLogin(context.Background(), cfg, out, func(context.Context, string) error { t.Fatal("opened browser for logged in service"); return nil }, time.Millisecond, time.Second)
+			err = runLogin(context.Background(), cfg, out, func(context.Context, string) error {
+				t.Fatal("opened browser for logged in service")
+				return nil
+			}, time.Millisecond, time.Second)
 			if err != nil || !strings.Contains(out.String(), "Already logged in") {
 				t.Fatal("repeat failed")
 			}
@@ -90,7 +93,12 @@ func TestTRAE003CLIErrorBoundaries(t *testing.T) {
 			if err == nil {
 				t.Fatal("expected error")
 			}
-			want := map[string]string{"cancel": "cancelled", "timeout": "timed out", "unauthorized": "authentication failed", "failed": "authorization failed"}[kind]
+			want := map[string]string{
+				"cancel":       "cancelled",
+				"timeout":      "timed out",
+				"unauthorized": "authentication failed",
+				"failed":       "authorization failed",
+			}[kind]
 			if !strings.Contains(err.Error(), want) {
 				t.Fatalf("err=%v", err)
 			}

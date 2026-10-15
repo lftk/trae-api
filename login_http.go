@@ -34,7 +34,11 @@ func (s *server) startLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u, _ := url.Parse(link)
-	writeJSON(w, 200, map[string]string{"status": "pending", "url": link, "attempt_id": u.Query().Get("login_trace_id")})
+	writeJSON(w, 200, map[string]string{
+		"status":     "pending",
+		"url":        link,
+		"attempt_id": u.Query().Get("login_trace_id"),
+	})
 }
 func (s *server) cancelLogin(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")

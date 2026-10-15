@@ -20,14 +20,70 @@ func TestParseFlags(t *testing.T) {
 		wantStdout string // substring expected in stdout
 		wantStderr string // substring expected in stderr
 	}{
-		{"no args continues", nil, false, 0, "", ""},
-		{"unknown command", []string{"whatever"}, true, 2, "", "unknown command"},
-		{"long version", []string{"--version"}, true, 0, "trae-api " + testVersion, ""},
-		{"short version", []string{"-version"}, true, 0, "trae-api " + testVersion, ""},
-		{"long help", []string{"--help"}, true, 0, "TRAE_API_ADDR", ""},
-		{"short help", []string{"-h"}, true, 0, "TRAE_API_ADDR", ""},
-		{"unknown flag", []string{"--wat"}, true, 2, "TRAE_API_ADDR", "flag provided but not defined: -wat"},
-		{"flag with value", []string{"-x=1"}, true, 2, "TRAE_API_ADDR", "flag provided but not defined: -x"},
+		{
+			"no args continues",
+			nil,
+			false,
+			0,
+			"",
+			"",
+		},
+		{
+			"unknown command",
+			[]string{"whatever"},
+			true,
+			2,
+			"",
+			"unknown command",
+		},
+		{
+			"long version",
+			[]string{"--version"},
+			true,
+			0,
+			"trae-api " + testVersion,
+			"",
+		},
+		{
+			"short version",
+			[]string{"-version"},
+			true,
+			0,
+			"trae-api " + testVersion,
+			"",
+		},
+		{
+			"long help",
+			[]string{"--help"},
+			true,
+			0,
+			"TRAE_API_ADDR",
+			"",
+		},
+		{
+			"short help",
+			[]string{"-h"},
+			true,
+			0,
+			"TRAE_API_ADDR",
+			"",
+		},
+		{
+			"unknown flag",
+			[]string{"--wat"},
+			true,
+			2,
+			"TRAE_API_ADDR",
+			"flag provided but not defined: -wat",
+		},
+		{
+			"flag with value",
+			[]string{"-x=1"},
+			true,
+			2,
+			"TRAE_API_ADDR",
+			"flag provided but not defined: -x",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

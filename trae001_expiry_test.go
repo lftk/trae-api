@@ -42,7 +42,9 @@ func TestTRAE001LegacyExpiry(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		c, err := a.exchange(context.Background(), credential{RefreshToken: "fixture"})
+		c, err := a.exchange(context.Background(), credential{
+			RefreshToken: "fixture",
+		})
 		if err != nil || !c.ExpiresAt.Equal(expiry) || !c.RefreshExpiresAt.Equal(expiry) {
 			t.Fatalf("expiry=%v refresh=%v err=%v", c.ExpiresAt, c.RefreshExpiresAt, err)
 		}

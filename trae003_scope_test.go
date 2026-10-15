@@ -25,7 +25,10 @@ func TestTRAE003StatelessChat(t *testing.T) {
 	cfg.BaseURL = up.URL
 	s := authenticatedServer(t, cfg)
 	for _, text := range []string{"first-only", "second-only"} {
-		w := callAPI(t, s, "/v1/chat/completions", map[string]any{"model": "m", "messages": []message{{Role: "user", Content: text}}}, "same")
+		w := callAPI(t, s, "/v1/chat/completions", map[string]any{"model": "m", "messages": []message{{
+			Role:    "user",
+			Content: text,
+		}}}, "same")
 		if w.Code != 200 {
 			t.Fatal(w.Body.String())
 		}
@@ -39,7 +42,10 @@ func TestTRAE003StatelessChat(t *testing.T) {
 }
 func TestTRAE003ResponsesUnsupported(t *testing.T) {
 	var calls atomic.Int32
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); fmt.Fprint(w, textFrames("answer")) }))
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		fmt.Fprint(w, textFrames("answer"))
+	}))
 	defer up.Close()
 	cfg := fixtureConfig()
 	cfg.BaseURL = up.URL

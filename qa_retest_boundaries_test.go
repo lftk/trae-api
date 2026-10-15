@@ -76,7 +76,13 @@ func TestQARetestSwitchImmediatelyBeforeRetrySend(t *testing.T) {
 				if which == "models" {
 					_, err = s.upstream.modelNames(context.Background(), c, g)
 				} else {
-					_, _, err = s.execute(context.Background(), chatRequest{Model: "m", Messages: []message{{Role: "user", Content: "synthetic A history"}}}, nil)
+					_, _, err = s.execute(context.Background(), chatRequest{
+						Model: "m",
+						Messages: []message{{
+							Role:    "user",
+							Content: "synthetic A history",
+						}},
+					}, nil)
 				}
 				close(wireTokens)
 				var got []string
@@ -119,7 +125,12 @@ func TestQARetestTemporaryRefreshFailureRecovers(t *testing.T) {
 			cfg.AuthBaseURL = up.URL
 			a, _ := newAuthManager(cfg)
 			defer a.client.CloseIdleConnections()
-			a.cred = credential{Token: "expired-A", UserID: "account", RefreshToken: "synthetic-refresh", ExpiresAt: time.Now().Add(-time.Second)}
+			a.cred = credential{
+				Token:        "expired-A",
+				UserID:       "account",
+				RefreshToken: "synthetic-refresh",
+				ExpiresAt:    time.Now().Add(-time.Second),
+			}
 			_, _, first := a.get(context.Background())
 			if first == nil || first == errLoginRequired {
 				t.Fatalf("5xx not temporary: %v", first)

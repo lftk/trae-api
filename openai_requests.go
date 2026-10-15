@@ -66,7 +66,16 @@ func decodeChatRequest(body json.RawMessage) (chatRequest, error) {
 	if err := json.Unmarshal(body, &fields); err != nil {
 		return chatRequest{}, err
 	}
-	req := chatRequest{Model: string(sdk.Model), Stream: fields.Stream, Parallel: optionalPointer(sdk.ParallelToolCalls), MaxTokens: int(sdk.MaxTokens.Value), MaxCompletionTokens: int(sdk.MaxCompletionTokens.Value), Temperature: optionalPointer(sdk.Temperature), TopP: optionalPointer(sdk.TopP), ToolChoice: fields.ToolChoice}
+	req := chatRequest{
+		Model:               string(sdk.Model),
+		Stream:              fields.Stream,
+		Parallel:            optionalPointer(sdk.ParallelToolCalls),
+		MaxTokens:           int(sdk.MaxTokens.Value),
+		MaxCompletionTokens: int(sdk.MaxCompletionTokens.Value),
+		Temperature:         optionalPointer(sdk.Temperature),
+		TopP:                optionalPointer(sdk.TopP),
+		ToolChoice:          fields.ToolChoice,
+	}
 	req.StreamOptions.IncludeUsage = sdk.StreamOptions.IncludeUsage.Value
 	if len(fields.Messages) != len(sdk.Messages) || len(fields.Tools) != len(sdk.Tools) {
 		return req, fmt.Errorf("invalid request arrays")
@@ -81,7 +90,12 @@ func decodeChatRequest(body json.RawMessage) (chatRequest, error) {
 		if role == nil || *role != f.Role {
 			return req, fmt.Errorf("unsupported role %q", f.Role)
 		}
-		normalized := message{Role: *role, Content: content, Name: f.Name, ToolCallID: f.ToolCallID}
+		normalized := message{
+			Role:       *role,
+			Content:    content,
+			Name:       f.Name,
+			ToolCallID: f.ToolCallID,
+		}
 		// Preserve call validation on every role. Only assistant calls may survive
 		// validateRequest; a missing type retains the historical function default.
 		for _, c := range f.ToolCalls {
@@ -98,7 +112,9 @@ func decodeChatRequest(body json.RawMessage) (chatRequest, error) {
 			return req, fmt.Errorf("only named function tools are supported")
 		}
 		fn := t.OfFunction.Function
-		v := tool{Type: "function"}
+		v := tool{
+			Type: "function",
+		}
 		v.Function.Name = fn.Name
 		v.Function.Description = fn.Description.Value
 		v.Function.Parameters = f.Function.Parameters

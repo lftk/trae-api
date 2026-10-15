@@ -14,12 +14,19 @@ func TestTRAE003RefreshRejectionIsStickyBut5xxIsNot(t *testing.T) {
 	for _, code := range []int{401, 403, 500} {
 		t.Run(fmt.Sprint(code), func(t *testing.T) {
 			calls := 0
-			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; w.WriteHeader(code) }))
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.WriteHeader(code)
+			}))
 			defer up.Close()
 			cfg := fixtureConfig()
 			cfg.AuthBaseURL = up.URL
 			a, _ := newAuthManager(cfg)
-			a.cred = credential{Token: "synthetic", RefreshToken: "synthetic-refresh", ExpiresAt: time.Now().Add(-time.Second)}
+			a.cred = credential{
+				Token:        "synthetic",
+				RefreshToken: "synthetic-refresh",
+				ExpiresAt:    time.Now().Add(-time.Second),
+			}
 			_, _, first := a.get(context.Background())
 			_, _, second := a.get(context.Background())
 			if code == 500 {
@@ -43,7 +50,10 @@ func TestTRAE003RefreshIdentityFormats(t *testing.T) {
 			cfg := fixtureConfig()
 			cfg.AuthBaseURL = up.URL
 			a, _ := newAuthManager(cfg)
-			_, err := a.exchange(context.Background(), credential{UserID: "account", RefreshToken: "synthetic"})
+			_, err := a.exchange(context.Background(), credential{
+				UserID:       "account",
+				RefreshToken: "synthetic",
+			})
 			if err != errLoginRequired {
 				t.Fatalf("identity mismatch accepted: %v", err)
 			}

@@ -27,11 +27,20 @@ func TestDeviceProofAndBoundRefresh(t *testing.T) {
 			return
 		}
 		var b struct {
-			ClientID, ClientSecret, RefreshToken, IDEVersion string
-			DeviceInfo                                       struct{ DeviceID, MachineID, PlatformCode, DevicePublicKey string }
-			DeviceProof                                      struct {
-				Signature, Nonce string
-				Timestamp        int64
+			ClientID     string
+			ClientSecret string
+			RefreshToken string
+			IDEVersion   string
+			DeviceInfo   struct {
+				DeviceID        string
+				MachineID       string
+				PlatformCode    string
+				DevicePublicKey string
+			}
+			DeviceProof struct {
+				Signature string
+				Nonce     string
+				Timestamp int64
 			}
 		}
 		if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
@@ -61,7 +70,11 @@ func TestDeviceProofAndBoundRefresh(t *testing.T) {
 		if b.ClientID != "en1oxy7wnw8j9n" || b.ClientSecret != "" || b.DeviceInfo.PlatformCode != "SOLO_PC" || b.DeviceInfo.DeviceID != "1234567890123456789" || b.DeviceInfo.MachineID != "machine" || b.DeviceProof.Nonce == "" || b.IDEVersion != "0.1.64" {
 			t.Errorf("bad device request %+v", b)
 		}
-		writeJSON(w, 200, map[string]any{"Result": map[string]any{"Token": "bound", "RefreshToken": "rotated", "TokenExpireAt": time.Now().Add(time.Hour).Unix()}})
+		writeJSON(w, 200, map[string]any{"Result": map[string]any{
+			"Token":         "bound",
+			"RefreshToken":  "rotated",
+			"TokenExpireAt": time.Now().Add(time.Hour).Unix(),
+		}})
 	}))
 	defer up.Close()
 	cfg := fixtureConfig()
@@ -71,7 +84,16 @@ func TestDeviceProofAndBoundRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.cred = credential{Token: "old", RefreshToken: "refresh", UserID: "u", ClientID: cfg.ClientID, DeviceID: "1234567890123456789", MachineID: "machine", DeviceKey: key, ExpiresAt: time.Now().Add(-time.Second)}
+	a.cred = credential{
+		Token:        "old",
+		RefreshToken: "refresh",
+		UserID:       "u",
+		ClientID:     cfg.ClientID,
+		DeviceID:     "1234567890123456789",
+		MachineID:    "machine",
+		DeviceKey:    key,
+		ExpiresAt:    time.Now().Add(-time.Second),
+	}
 	c, _, err := a.get(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -150,13 +172,23 @@ func TestBatchModelsRoutingAndMax(t *testing.T) {
 	cfg.BaseURL = up.URL
 	s, _ := newServer(cfg)
 	defer s.shutdown()
-	s.auth.cred = credential{Token: "token", UserID: "u"}
+	s.auth.cred = credential{
+		Token:  "token",
+		UserID: "u",
+	}
 	c, g, _ := s.auth.get(context.Background())
 	names, err := s.upstream.modelNames(context.Background(), c, g)
 	if err != nil || strings.Join(names, ",") != "alpha,alpha-max" {
 		t.Fatalf("names=%v err=%v", names, err)
 	}
-	_, res, err := s.execute(context.Background(), chatRequest{Model: "alpha-max", MaxTokens: 5000, Messages: []message{{Role: "user", Content: "hi"}}}, nil)
+	_, res, err := s.execute(context.Background(), chatRequest{
+		Model:     "alpha-max",
+		MaxTokens: 5000,
+		Messages: []message{{
+			Role:    "user",
+			Content: "hi",
+		}},
+	}, nil)
 	if err != nil || res.Message.Content != "ok" || batch != 1 {
 		t.Fatalf("result=%+v err=%v batch=%d", res, err, batch)
 	}

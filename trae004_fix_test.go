@@ -39,7 +39,12 @@ func TestTRAE004String401RefreshOnce(t *testing.T) {
 			cfg.AuthBaseURL = up.URL
 			s, _ := newServer(cfg)
 			defer s.shutdown()
-			s.auth.cred = credential{Token: "old", RefreshToken: "refresh", UserID: "u", ClientID: cfg.ClientID}
+			s.auth.cred = credential{
+				Token:        "old",
+				RefreshToken: "refresh",
+				UserID:       "u",
+				ClientID:     cfg.ClientID,
+			}
 			c, g := s.auth.snapshot()
 			names, err := s.upstream.modelNames(context.Background(), c, g)
 			if batches != 2 || refreshes != 1 || details != 0 {
@@ -59,12 +64,21 @@ func TestTRAE004String401RefreshOnce(t *testing.T) {
 func TestTRAE004MaxBudgetStaysWithinWindow(t *testing.T) {
 	for _, asked := range []int{0, 2000, 500} {
 		t.Run(fmt.Sprint(asked), func(t *testing.T) {
-			r := chatRequest{Model: "m-max", MaxTokens: asked}
+			r := chatRequest{
+				Model:     "m-max",
+				MaxTokens: asked,
+			}
 			if asked == 2000 {
 				r.MaxTokens = 10
 				r.MaxCompletionTokens = asked
 			}
-			body := buildRoutedIDEBody(r, "id", modelRoute{function: "chat_v3", base: "m", name: "m__max", most: 2000, window: 1000})
+			body := buildRoutedIDEBody(r, "id", modelRoute{
+				function: "chat_v3",
+				base:     "m",
+				name:     "m__max",
+				most:     2000,
+				window:   1000,
+			})
 			limit, ok := body["max_tokens"].(int)
 			if !ok {
 				t.Fatalf("missing max_tokens: %v", body)
@@ -97,8 +111,14 @@ func TestTRAE004UnknownExplicitStreamingModelRejectedBeforeOutput(t *testing.T) 
 	cfg.BaseURL = up.URL
 	s, _ := newServer(cfg)
 	defer s.shutdown()
-	s.auth.cred = credential{Token: "synthetic", UserID: "u"}
-	rr := callAPI(t, s, "/v1/chat/completions", map[string]any{"model": "missing", "stream": true, "messages": []message{{Role: "user", Content: "hello"}}}, "")
+	s.auth.cred = credential{
+		Token:  "synthetic",
+		UserID: "u",
+	}
+	rr := callAPI(t, s, "/v1/chat/completions", map[string]any{"model": "missing", "stream": true, "messages": []message{{
+		Role:    "user",
+		Content: "hello",
+	}}}, "")
 	var errorBody map[string]any
 	if rr.Code != 400 || strings.Contains(rr.Body.String(), "data:") || json.Unmarshal(rr.Body.Bytes(), &errorBody) != nil || errorBody["error"] == nil || batches != 1 || prompts != 0 {
 		t.Fatalf("status=%d body=%q batches=%d prompts=%d", rr.Code, rr.Body.String(), batches, prompts)
