@@ -36,9 +36,18 @@ func TestAccountSlotsQueueCancellationAndRelease(t *testing.T) {
 	cfg.MaxConcurrent = 1
 	cfg.QueueTimeout = 20 * time.Millisecond
 	s := authenticatedServer(t, cfg)
-	request := chatRequest{Model: "m", Messages: []message{{Role: "user", Content: "hi"}}}
+	request := chatRequest{
+		Model: "m",
+		Messages: []message{{
+			Role:    "user",
+			Content: "hi",
+		}},
+	}
 	first := make(chan error, 1)
-	go func() { _, _, e := s.execute(context.Background(), request, nil); first <- e }()
+	go func() {
+		_, _, e := s.execute(context.Background(), request, nil)
+		first <- e
+	}()
 	<-started
 	_, _, e := s.execute(context.Background(), request, nil)
 	if statusForError(e) != 503 || max.Load() != 1 {
@@ -55,7 +64,10 @@ func TestAccountSlotsQueueCancellationAndRelease(t *testing.T) {
 		t.Fatal(e)
 	}
 	next := make(chan error, 1)
-	go func() { _, _, e := s.execute(context.Background(), request, nil); next <- e }()
+	go func() {
+		_, _, e := s.execute(context.Background(), request, nil)
+		next <- e
+	}()
 	<-started
 	release <- struct{}{}
 	if e = <-next; e != nil {
@@ -82,7 +94,13 @@ func TestCancellationStopsUpstreamAndReleasesSlot(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, _, e := s.execute(ctx, chatRequest{Model: "m", Messages: []message{{Role: "user", Content: "hi"}}}, nil)
+		_, _, e := s.execute(ctx, chatRequest{
+			Model: "m",
+			Messages: []message{{
+				Role:    "user",
+				Content: "hi",
+			}},
+		}, nil)
 		done <- e
 	}()
 	<-started

@@ -26,7 +26,11 @@ func chatUsage(u *usage) openai.CompletionUsage {
 	if u == nil {
 		return openai.CompletionUsage{}
 	}
-	v := openai.CompletionUsage{PromptTokens: int64(u.Input), CompletionTokens: int64(u.Output), TotalTokens: int64(u.Total)}
+	v := openai.CompletionUsage{
+		PromptTokens:     int64(u.Input),
+		CompletionTokens: int64(u.Output),
+		TotalTokens:      int64(u.Total),
+	}
 	if u.InputDetails != nil {
 		v.PromptTokensDetails.CachedTokens = int64(u.InputDetails.CachedTokens)
 	}
@@ -83,5 +87,7 @@ func (v openAIErrorJSON) MarshalJSON() ([]byte, error) {
 	}
 	return json.Marshal(struct {
 		Error rawJSONFields `json:"error"`
-	}{fields})
+	}{
+		fields,
+	})
 }

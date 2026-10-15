@@ -43,7 +43,16 @@ func TestQA004DefectString401MustRefreshOnce(t *testing.T) {
 }
 
 func TestQA004DefectMaxWindowNonnegative(t *testing.T) {
-	body := buildRoutedIDEBody(chatRequest{Model: "m-max", MaxTokens: 2000}, "synthetic-id", modelRoute{function: "chat_v3", base: "m", name: "m__max", most: 2000, window: 1000})
+	body := buildRoutedIDEBody(chatRequest{
+		Model:     "m-max",
+		MaxTokens: 2000,
+	}, "synthetic-id", modelRoute{
+		function: "chat_v3",
+		base:     "m",
+		name:     "m__max",
+		most:     2000,
+		window:   1000,
+	})
 	info := body["user_message_context"].(map[string]any)["model_info"].(map[string]any)
 	budget := info["prompt_max_tokens"].(int)
 	limit, ok := body["max_tokens"].(int)

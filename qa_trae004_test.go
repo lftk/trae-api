@@ -51,7 +51,15 @@ func TestQA004ConcurrentRefreshSharesOneExchange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.cred = credential{Token: "expired-A", UserID: "user-A", RefreshToken: "refresh-A", DeviceID: "device-A", MachineID: "machine-A", DeviceKey: key, ExpiresAt: time.Now().Add(-time.Second)}
+	a.cred = credential{
+		Token:        "expired-A",
+		UserID:       "user-A",
+		RefreshToken: "refresh-A",
+		DeviceID:     "device-A",
+		MachineID:    "machine-A",
+		DeviceKey:    key,
+		ExpiresAt:    time.Now().Add(-time.Second),
+	}
 	const callers = 12
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -76,7 +84,10 @@ func TestQA004ConcurrentRefreshSharesOneExchange(t *testing.T) {
 	entered := make(chan struct{}, callers-1)
 	wg.Add(callers - 1)
 	for i := 1; i < callers; i++ {
-		go check(qa004WaitingContext{Context: context.Background(), entered: entered})
+		go check(qa004WaitingContext{
+			Context: context.Background(),
+			entered: entered,
+		})
 	}
 	for i := 1; i < callers; i++ {
 		select {
@@ -123,7 +134,11 @@ func TestQA004RefreshTokenRotationThenOmissionRetainsLatest(t *testing.T) {
 		seen = append(seen, body.RefreshToken)
 		attempt := len(seen)
 		mu.Unlock()
-		result := map[string]any{"Token": fmt.Sprintf("fresh-%d", attempt), "UserID": "user-A", "TokenExpireAt": time.Now().Add(time.Hour).Unix()}
+		result := map[string]any{
+			"Token":         fmt.Sprintf("fresh-%d", attempt),
+			"UserID":        "user-A",
+			"TokenExpireAt": time.Now().Add(time.Hour).Unix(),
+		}
 		if attempt == 1 {
 			result["RefreshToken"] = "refresh-rotated"
 		}
@@ -141,7 +156,15 @@ func TestQA004RefreshTokenRotationThenOmissionRetainsLatest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.cred = credential{Token: "expired", UserID: "user-A", RefreshToken: "refresh-original", DeviceID: "device-A", MachineID: "machine-A", DeviceKey: key, ExpiresAt: time.Now().Add(-time.Second)}
+	a.cred = credential{
+		Token:        "expired",
+		UserID:       "user-A",
+		RefreshToken: "refresh-original",
+		DeviceID:     "device-A",
+		MachineID:    "machine-A",
+		DeviceKey:    key,
+		ExpiresAt:    time.Now().Add(-time.Second),
+	}
 	for attempt := 1; attempt <= 2; attempt++ {
 		c, _, err := a.get(context.Background())
 		if err != nil || c.RefreshToken != "refresh-rotated" || c.UserID != "user-A" || c.DeviceID != "device-A" || c.MachineID != "machine-A" || c.DeviceKey != key {
@@ -162,11 +185,26 @@ func TestQA004RefreshTokenRotationThenOmissionRetainsLatest(t *testing.T) {
 
 func TestQA004StringAuthCodeRetriesOnceButBusinessCodeDoesNot(t *testing.T) {
 	for _, tc := range []struct {
-		name, code                          string
-		wantLists, wantRefresh, wantDetails int
+		name        string
+		code        string
+		wantLists   int
+		wantRefresh int
+		wantDetails int
 	}{
-		{"rejected_after_refresh", "1001", 2, 1, 0},
-		{"business_error_discovery_fallback", "1002", 1, 0, 4},
+		{
+			"rejected_after_refresh",
+			"1001",
+			2,
+			1,
+			0,
+		},
+		{
+			"business_error_discovery_fallback",
+			"1002",
+			1,
+			0,
+			4,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var lists, refreshes, details int

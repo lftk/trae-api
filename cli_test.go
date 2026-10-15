@@ -13,10 +13,30 @@ func TestTRAE003LoginCommandParsing(t *testing.T) {
 		stop   bool
 		output string
 	}{
-		{[]string{"login", "--help"}, 0, true, "trae-api login"},
-		{[]string{"unknown"}, 2, true, ""},
-		{[]string{"login", "extra"}, 2, true, ""},
-		{[]string{"login"}, 0, false, ""},
+		{
+			[]string{"login", "--help"},
+			0,
+			true,
+			"trae-api login",
+		},
+		{
+			[]string{"unknown"},
+			2,
+			true,
+			"",
+		},
+		{
+			[]string{"login", "extra"},
+			2,
+			true,
+			"",
+		},
+		{
+			[]string{"login"},
+			0,
+			false,
+			"",
+		},
 	} {
 		out, errOut := &bytes.Buffer{}, &bytes.Buffer{}
 		code, stop := parseFlags(tc.args, out, errOut)

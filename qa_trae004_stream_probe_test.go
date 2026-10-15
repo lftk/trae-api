@@ -22,7 +22,10 @@ func TestQA004DefectUnknownExplicitModelStreamingStatus(t *testing.T) {
 	cfg.BaseURL = up.URL
 	s := authenticatedServer(t, cfg)
 	defer s.shutdown()
-	w := callAPI(t, s, "/v1/chat/completions", map[string]any{"model": "missing", "stream": true, "messages": []message{{Role: "user", Content: "hi"}}}, "")
+	w := callAPI(t, s, "/v1/chat/completions", map[string]any{"model": "missing", "stream": true, "messages": []message{{
+		Role:    "user",
+		Content: "hi",
+	}}}, "")
 	var response map[string]any
 	if w.Code != 400 || strings.Contains(w.Body.String(), "data:") || json.Unmarshal(w.Body.Bytes(), &response) != nil || response["error"] == nil {
 		t.Fatalf("invalid explicit model returned HTTP %d; sse=%t; body=%q", w.Code, strings.Contains(w.Body.String(), "data:"), w.Body.String())

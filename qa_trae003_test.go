@@ -14,9 +14,38 @@ import (
 
 func TestQA003ActualAPIRouteProtection(t *testing.T) {
 	routes := []struct {
-		method, path string
-		status       int
-	}{{"GET", "/healthz", 200}, {"GET", "/v1/models", 401}, {"POST", "/v1/chat/completions", 400}, {"POST", "/v1/responses", 501}, {"POST", "/api/auth/login", 200}, {"POST", "/api/auth/login/status", 404}, {"POST", "/api/auth/login/cancel", 404}}
+		method string
+		path   string
+		status int
+	}{{
+		"GET",
+		"/healthz",
+		200,
+	}, {
+		"GET",
+		"/v1/models",
+		401,
+	}, {
+		"POST",
+		"/v1/chat/completions",
+		400,
+	}, {
+		"POST",
+		"/v1/responses",
+		501,
+	}, {
+		"POST",
+		"/api/auth/login",
+		200,
+	}, {
+		"POST",
+		"/api/auth/login/status",
+		404,
+	}, {
+		"POST",
+		"/api/auth/login/cancel",
+		404,
+	}}
 	for _, token := range []string{"", "synthetic-gateway"} {
 		cfg := fixtureConfig()
 		cfg.APIToken = token
@@ -77,7 +106,9 @@ func (w *qaDeadlineWriter) SetWriteDeadline(d time.Time) error {
 	return nil
 }
 func TestQA003EachSSEWriteRenewsDeadline(t *testing.T) {
-	w := &qaDeadlineWriter{ResponseRecorder: httptest.NewRecorder()}
+	w := &qaDeadlineWriter{
+		ResponseRecorder: httptest.NewRecorder(),
+	}
 	s := newStreamSink(w, httptest.NewRequest("GET", "http://127.0.0.1/", nil))
 	defer s.close()
 	for i, f := range []func() error{func() error { return s.send("", map[string]string{"x": "start"}) }, s.heartbeat, s.done} {
@@ -123,7 +154,13 @@ func TestQA003CurrentRejectedTokenRequiresLogin(t *testing.T) {
 			if which == "models" {
 				_, err = s.upstream.modelNames(context.Background(), c, g)
 			} else {
-				_, err = s.upstream.prompt(context.Background(), c, g, chatRequest{Model: "m", Messages: []message{{Role: "user", Content: "hi"}}}, "qa", nil)
+				_, err = s.upstream.prompt(context.Background(), c, g, chatRequest{
+					Model: "m",
+					Messages: []message{{
+						Role:    "user",
+						Content: "hi",
+					}},
+				}, "qa", nil)
 			}
 			if err != errLoginRequired || calls != 2 || refresh != 1 {
 				t.Fatalf("err=%v calls=%d refresh=%d", err, calls, refresh)
@@ -157,7 +194,10 @@ func TestQA003LostStartResponseBoundedAndReplaceable(t *testing.T) {
 	u, _ := url.Parse(api.URL)
 	cfg := fixtureConfig()
 	cfg.Addr = u.Host
-	err := runLogin(context.Background(), cfg, &bytes.Buffer{}, func(context.Context, string) error { t.Error("browser opened despite lost response"); return nil }, time.Millisecond, time.Second)
+	err := runLogin(context.Background(), cfg, &bytes.Buffer{}, func(context.Context, string) error {
+		t.Error("browser opened despite lost response")
+		return nil
+	}, time.Millisecond, time.Second)
 	if err == nil || orphan == "" {
 		t.Fatalf("err=%v orphan=%q", err, orphan)
 	}
@@ -220,7 +260,13 @@ func TestQA003RefreshCannotReplayAcrossAccounts(t *testing.T) {
 				if which == "models" {
 					_, err = s.upstream.modelNames(context.Background(), c, g)
 				} else {
-					_, _, err = s.execute(context.Background(), chatRequest{Model: "m", Messages: []message{{Role: "user", Content: "private account A history"}}}, nil)
+					_, _, err = s.execute(context.Background(), chatRequest{
+						Model: "m",
+						Messages: []message{{
+							Role:    "user",
+							Content: "private account A history",
+						}},
+					}, nil)
 				}
 				done <- err
 			}()
@@ -266,7 +312,13 @@ func TestQA003ExchangeHTTPRejectionRequiresLogin(t *testing.T) {
 			cfg.AuthBaseURL = up.URL
 			s := authenticatedServer(t, cfg)
 			s.auth.cred.RefreshToken = "synthetic-refresh"
-			_, _, err := s.execute(context.Background(), chatRequest{Model: "m", Messages: []message{{Role: "user", Content: "hi"}}}, nil)
+			_, _, err := s.execute(context.Background(), chatRequest{
+				Model: "m",
+				Messages: []message{{
+					Role:    "user",
+					Content: "hi",
+				}},
+			}, nil)
 			if err != errLoginRequired || statusForError(err) != 401 {
 				t.Errorf("refresh HTTP %d maps to %v / gateway HTTP %d; want login-required / 401", code, err, statusForError(err))
 			}

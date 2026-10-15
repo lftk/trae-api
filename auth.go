@@ -38,10 +38,11 @@ type credential struct {
 	DeviceKey        *ecdsa.PrivateKey `json:"-"`
 }
 type loginAttempt struct {
-	expires         time.Time
-	device, machine string
-	key             *ecdsa.PrivateKey
-	generation      uint64
+	expires    time.Time
+	device     string
+	machine    string
+	key        *ecdsa.PrivateKey
+	generation uint64
 }
 type loginResult struct {
 	Status  string
@@ -65,10 +66,19 @@ type authManager struct {
 func newHTTPClient(timeout time.Duration) *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.ResponseHeaderTimeout = 30 * time.Second
-	return &http.Client{Transport: transport, Timeout: timeout, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
+	return &http.Client{
+		Transport:     transport,
+		Timeout:       timeout,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
+	}
 }
 func newAuthManager(c config) (*authManager, error) {
-	return &authManager{cfg: c, client: newHTTPClient(30 * time.Second), pending: map[string]loginAttempt{}, loginResults: map[string]loginResult{}}, nil
+	return &authManager{
+		cfg:          c,
+		client:       newHTTPClient(30 * time.Second),
+		pending:      map[string]loginAttempt{},
+		loginResults: map[string]loginResult{},
+	}, nil
 }
 func (a *authManager) snapshot() (credential, uint64) {
 	a.mu.Lock()
@@ -207,13 +217,43 @@ func (a *authManager) beginLogin() (string, error) {
 	if _, err = rand.Read(machine); err != nil {
 		return "", fmt.Errorf("machine ID generation failed")
 	}
-	p := loginAttempt{expires: now.Add(10 * time.Minute), device: device, machine: fmt.Sprintf("%x", machine), key: key, generation: a.generation}
+	p := loginAttempt{
+		expires:    now.Add(10 * time.Minute),
+		device:     device,
+		machine:    fmt.Sprintf("%x", machine),
+		key:        key,
+		generation: a.generation,
+	}
 	a.pending[state] = p
 	a.latestLogin = state
-	a.loginResults[state] = loginResult{Status: "pending", Expires: p.expires}
+	a.loginResults[state] = loginResult{
+		Status:  "pending",
+		Expires: p.expires,
+	}
 	u, _ := url.Parse(a.cfg.AuthURL)
 	q := u.Query()
-	values := map[string]string{"login_version": "1", "auth_from": "solo", "login_channel": "native_ide", "plugin_version": "2.3.24254", "auth_type": "local", "client_id": a.cfg.ClientID, "redirect": "0", "login_trace_id": state, "auth_callback_url": a.callbackURL, "machine_id": p.machine, "device_id": p.device, "x_device_id": p.device, "x_machine_id": p.machine, "x_device_brand": "ASUS TUF Gaming A15 FA507RM_FA507RM", "x_device_type": "windows", "x_os_version": "Windows 10 Pro", "x_env": "", "x_app_version": a.cfg.IDEVersion, "x_app_type": "stable", "hide_saas_login": "true"}
+	values := map[string]string{
+		"login_version":     "1",
+		"auth_from":         "solo",
+		"login_channel":     "native_ide",
+		"plugin_version":    "2.3.24254",
+		"auth_type":         "local",
+		"client_id":         a.cfg.ClientID,
+		"redirect":          "0",
+		"login_trace_id":    state,
+		"auth_callback_url": a.callbackURL,
+		"machine_id":        p.machine,
+		"device_id":         p.device,
+		"x_device_id":       p.device,
+		"x_machine_id":      p.machine,
+		"x_device_brand":    "ASUS TUF Gaming A15 FA507RM_FA507RM",
+		"x_device_type":     "windows",
+		"x_os_version":      "Windows 10 Pro",
+		"x_env":             "",
+		"x_app_version":     a.cfg.IDEVersion,
+		"x_app_type":        "stable",
+		"hide_saas_login":   "true",
+	}
 	for k, v := range values {
 		q.Set(k, v)
 	}
@@ -260,7 +300,15 @@ func (a *authManager) callback(w http.ResponseWriter, r *http.Request) {
 		fail(400, "仅支持国内版 Trae CN 账号。")
 		return
 	}
-	c := credential{Token: firstString(jwt, "Token", "token"), RefreshToken: firstString(jwt, "RefreshToken", "refreshToken"), UserID: firstString(info, "UserID", "UserId", "userId", "userID"), ClientID: firstString(jwt, "ClientID", "clientId"), DeviceID: p.device, MachineID: p.machine, DeviceKey: p.key}
+	c := credential{
+		Token:        firstString(jwt, "Token", "token"),
+		RefreshToken: firstString(jwt, "RefreshToken", "refreshToken"),
+		UserID:       firstString(info, "UserID", "UserId", "userId", "userID"),
+		ClientID:     firstString(jwt, "ClientID", "clientId"),
+		DeviceID:     p.device,
+		MachineID:    p.machine,
+		DeviceKey:    p.key,
+	}
 	if c.ClientID == "" {
 		c.ClientID = q.Get("clientID")
 	}
@@ -364,7 +412,19 @@ func (a *authManager) boundExchange(ctx context.Context, c credential) (credenti
 	if err != nil {
 		return c, fmt.Errorf("device public key encoding failed")
 	}
-	clients := []struct{ id, platform, version string }{{"en1oxy7wnw8j9n", "SOLO_PC", "0.1.64"}, {"ono9krqynydwx5", "IDE_PC", "3.3.99"}}
+	clients := []struct {
+		id       string
+		platform string
+		version  string
+	}{{
+		"en1oxy7wnw8j9n",
+		"SOLO_PC",
+		"0.1.64",
+	}, {
+		"ono9krqynydwx5",
+		"IDE_PC",
+		"3.3.99",
+	}}
 	var last error
 	for _, as := range clients {
 		nonce := make([]byte, 16)
@@ -380,8 +440,15 @@ func (a *authManager) boundExchange(ctx context.Context, c credential) (credenti
 			return c, fmt.Errorf("device signing failed")
 		}
 		body := map[string]any{"ClientID": as.id, "ClientSecret": "", "RefreshToken": c.RefreshToken, "IDEVersion": as.version,
-			"DeviceProof": map[string]any{"Signature": base64.StdEncoding.EncodeToString(sig), "Timestamp": at, "Nonce": hexNonce},
-			"DeviceInfo":  map[string]any{"DeviceID": c.DeviceID, "MachineID": c.MachineID, "PlatformCode": as.platform, "DeviceType": "PC", "DeviceName": "", "DeviceModel": "", "ClientVersion": as.version, "DevicePublicKey": string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pub})), "DeviceBrand": "ASUS TUF Gaming A15 FA507RM_FA507RM", "DeviceCPU": "AMD", "OSInfo": "Windows", "OSVersion": "10.0.22631"}}
+			"DeviceProof": map[string]any{
+				"Signature": base64.StdEncoding.EncodeToString(sig),
+				"Timestamp": at,
+				"Nonce":     hexNonce,
+			},
+			"DeviceInfo": map[string]any{"DeviceID": c.DeviceID, "MachineID": c.MachineID, "PlatformCode": as.platform, "DeviceType": "PC", "DeviceName": "", "DeviceModel": "", "ClientVersion": as.version, "DevicePublicKey": string(pem.EncodeToMemory(&pem.Block{
+				Type:  "PUBLIC KEY",
+				Bytes: pub,
+			})), "DeviceBrand": "ASUS TUF Gaming A15 FA507RM_FA507RM", "DeviceCPU": "AMD", "OSInfo": "Windows", "OSVersion": "10.0.22631"}}
 		req, e := http.NewRequestWithContext(ctx, "POST", strings.TrimRight(a.cfg.AuthBaseURL, "/")+deviceExchangePath, bytes.NewBufferString(jsonText(body)))
 		if e != nil {
 			return c, e
@@ -412,7 +479,12 @@ func (a *authManager) boundExchange(ctx context.Context, c credential) (credenti
 	return c, last
 }
 func (a *authManager) legacyExchange(ctx context.Context, c credential) (credential, error) {
-	payload := map[string]string{"ClientID": c.ClientID, "RefreshToken": c.RefreshToken, "ClientSecret": "-", "UserID": c.UserID}
+	payload := map[string]string{
+		"ClientID":     c.ClientID,
+		"RefreshToken": c.RefreshToken,
+		"ClientSecret": "-",
+		"UserID":       c.UserID,
+	}
 	req, e := http.NewRequestWithContext(ctx, "POST", strings.TrimRight(a.cfg.AuthBaseURL, "/")+"/cloudide/api/v3/trae/oauth/ExchangeToken", bytes.NewBufferString(jsonText(payload)))
 	if e != nil {
 		return c, e
@@ -558,7 +630,14 @@ func (s *server) startAuthListener() (*http.Server, error) {
 		}
 		s.auth.callback(w, r)
 	})
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 128 << 10}
+	srv := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    128 << 10,
+	}
 	go func() { _ = srv.Serve(listener) }()
 	return srv, nil
 }

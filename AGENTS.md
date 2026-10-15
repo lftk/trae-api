@@ -12,6 +12,16 @@
 - `upstream.go` directly converts requests to the known CN IDE protocol and parses SSE including multiple tool identities and native argument fragments. Never execute caller tools or invent tool success.
 - `/v1/responses` explicitly returns 501 unsupported. Do not add Responses adapters or continuation IDs.
 
+## Go style and maintainability
+
+- Apply these conventions to production Go code and tests; format all Go files with gofmt.
+- Declare one struct field per line. Do not group names such as `Addr, APIToken string` in one field declaration.
+- Write every nonempty struct literal across multiple lines, with one field per line and keyed fields where available. Apply this to named, anonymous, nested, pointer and generic structs, including elements whose types are inferred inside slices or maps. Empty literals such as `T{}` may remain on one line; maps and slices are not themselves struct literals.
+- Write normal multiline statements and error checks rather than semicolon-compressed functions. Use clear local names, guard clauses and small cohesive functions; avoid unnecessary wrappers, interfaces or package fragmentation.
+- Prefer small named types for stable protocol shapes and internal model metadata. Keep dynamic JSON and raw schemas where polymorphism or compatibility requires them; preserve absent/null fields, numeric/string error codes and accepted aliases.
+- Reuse the standard library and existing SDK types. Preserve protocol values, serialization, error behavior, concurrency, lock order and retry boundaries during style-only refactors. Investigate ignored errors before changing them; report behavior-changing fixes separately.
+- Separate mechanical formatting commits from structural refactors. Retain existing regression assertions and use type-aware struct-layout checks in addition to gofmt; do not infer struct violations from comma-based regular expressions.
+
 ## Validation
 
 Run `go test ./...`, `go test -race ./...`, `go vet ./...`, and `go build -o trae-api .`. Tests use synthetic credentials, mocked upstreams and injected browser openers. No real-model opt-in test or credential-file loading is included.

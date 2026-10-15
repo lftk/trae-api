@@ -11,7 +11,22 @@ func TestTRAE001ManagementHost(t *testing.T) {
 	s := authenticatedServer(t, fixtureConfig())
 	s.auth.callbackURL = "http://127.0.0.1:8765/authorize"
 	for _, host := range []string{"attacker.invalid:8723", "localhost.attacker.invalid:8723", "127.0.0.1.attacker.invalid:8723", "0.0.0.0:8723", "[::]:8723"} {
-		for _, route := range []struct{ method, path string }{{"GET", "/web/login"}, {"GET", "/api/auth/status"}, {"POST", "/api/auth/login"}, {"POST", "/api/auth/logout"}} {
+		for _, route := range []struct {
+			method string
+			path   string
+		}{{
+			"GET",
+			"/web/login",
+		}, {
+			"GET",
+			"/api/auth/status",
+		}, {
+			"POST",
+			"/api/auth/login",
+		}, {
+			"POST",
+			"/api/auth/logout",
+		}} {
 			t.Run(host+route.path, func(t *testing.T) {
 				r := httptest.NewRequest(route.method, "http://"+host+route.path, nil)
 				r.Header.Set("Origin", "http://"+host)

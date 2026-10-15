@@ -33,7 +33,10 @@ func decodeBody(w http.ResponseWriter, r *http.Request) (*decodedRequest, error)
 	if e := d.Decode(&body); e != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(e, &tooLarge) {
-			return nil, &apiError{413, "request body exceeds 4 MiB limit"}
+			return nil, &apiError{
+				413,
+				"request body exceeds 4 MiB limit",
+			}
 		}
 		return nil, badRequest("invalid JSON request")
 	}
@@ -61,7 +64,10 @@ func decodeBody(w http.ResponseWriter, r *http.Request) (*decodedRequest, error)
 			return nil, badRequest("only text response_format is supported")
 		}
 	}
-	return &decodedRequest{Body: body, Fields: raw}, nil
+	return &decodedRequest{
+		Body:   body,
+		Fields: raw,
+	}, nil
 }
 func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 	raw, e := decodeBody(w, r)
@@ -85,14 +91,25 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 		emit = func(d delta) error {
 			if d.Start {
 				model = d.Model
-				return sink.send("", chatChunk(id, created, model, openai.ChatCompletionChunkChoiceDelta{Role: "assistant"}, "", nil))
+				return sink.send("", chatChunk(id, created, model, openai.ChatCompletionChunkChoiceDelta{
+					Role: "assistant",
+				}, "", nil))
 			}
 			if d.Heartbeat {
 				return sink.heartbeat()
 			}
-			value := openai.ChatCompletionChunkChoiceDelta{Content: d.Text}
+			value := openai.ChatCompletionChunkChoiceDelta{
+				Content: d.Text,
+			}
 			if d.Call != nil {
-				call := openai.ChatCompletionChunkChoiceDeltaToolCall{Index: int64(d.Index), ID: d.Call.ID, Function: openai.ChatCompletionChunkChoiceDeltaToolCallFunction{Name: d.Call.Function.Name, Arguments: d.Call.Function.Arguments}}
+				call := openai.ChatCompletionChunkChoiceDeltaToolCall{
+					Index: int64(d.Index),
+					ID:    d.Call.ID,
+					Function: openai.ChatCompletionChunkChoiceDeltaToolCallFunction{
+						Name:      d.Call.Function.Name,
+						Arguments: d.Call.Function.Arguments,
+					},
+				}
 				if call.ID != "" {
 					call.Type = "function"
 				}
@@ -125,18 +142,46 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if req.StreamOptions.IncludeUsage {
-			if e = sink.send("", openai.ChatCompletionChunk{ID: id, Object: "chat.completion.chunk", Created: created, Model: effective.Model, Choices: []openai.ChatCompletionChunkChoice{}, Usage: chatUsage(result.Usage)}); e != nil {
+			if e = sink.send("", openai.ChatCompletionChunk{
+				ID:      id,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   effective.Model,
+				Choices: []openai.ChatCompletionChunkChoice{},
+				Usage:   chatUsage(result.Usage),
+			}); e != nil {
 				return
 			}
 		}
 		_ = sink.done()
 		return
 	}
-	msg := openai.ChatCompletionMessage{Role: "assistant", Content: result.Message.Content}
-	for _, call := range result.Message.ToolCalls {
-		msg.ToolCalls = append(msg.ToolCalls, openai.ChatCompletionMessageToolCallUnion{ID: call.ID, Type: "function", Function: openai.ChatCompletionMessageFunctionToolCallFunction{Name: call.Function.Name, Arguments: call.Function.Arguments}})
+	msg := openai.ChatCompletionMessage{
+		Role:    "assistant",
+		Content: result.Message.Content,
 	}
-	resultBody := openai.ChatCompletion{ID: id, Object: "chat.completion", Created: created, Model: effective.Model, Choices: []openai.ChatCompletionChoice{{Index: 0, Message: msg, FinishReason: result.Finish}}, Usage: chatUsage(result.Usage)}
+	for _, call := range result.Message.ToolCalls {
+		msg.ToolCalls = append(msg.ToolCalls, openai.ChatCompletionMessageToolCallUnion{
+			ID:   call.ID,
+			Type: "function",
+			Function: openai.ChatCompletionMessageFunctionToolCallFunction{
+				Name:      call.Function.Name,
+				Arguments: call.Function.Arguments,
+			},
+		})
+	}
+	resultBody := openai.ChatCompletion{
+		ID:      id,
+		Object:  "chat.completion",
+		Created: created,
+		Model:   effective.Model,
+		Choices: []openai.ChatCompletionChoice{{
+			Index:        0,
+			Message:      msg,
+			FinishReason: result.Finish,
+		}},
+		Usage: chatUsage(result.Usage),
+	}
 	if result.Reasoning == "" {
 		writeJSON(w, 200, resultBody)
 		return
@@ -149,7 +194,18 @@ func (s *server) chat(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, body)
 }
 func chatChunk(id string, created int64, model string, d openai.ChatCompletionChunkChoiceDelta, finish string, u *usage) openai.ChatCompletionChunk {
-	return openai.ChatCompletionChunk{ID: id, Object: "chat.completion.chunk", Created: created, Model: model, Choices: []openai.ChatCompletionChunkChoice{{Index: 0, Delta: d, FinishReason: finish}}, Usage: chatUsage(u)}
+	return openai.ChatCompletionChunk{
+		ID:      id,
+		Object:  "chat.completion.chunk",
+		Created: created,
+		Model:   model,
+		Choices: []openai.ChatCompletionChunkChoice{{
+			Index:        0,
+			Delta:        d,
+			FinishReason: finish,
+		}},
+		Usage: chatUsage(u),
+	}
 }
 func (s *server) models(w http.ResponseWriter, r *http.Request) {
 	c, g, e := s.auth.get(r.Context())
@@ -164,7 +220,12 @@ func (s *server) models(w http.ResponseWriter, r *http.Request) {
 	}
 	models := make([]openai.Model, 0, len(names))
 	for _, name := range names {
-		models = append(models, openai.Model{ID: name, Object: "model", Created: 0, OwnedBy: "trae"})
+		models = append(models, openai.Model{
+			ID:      name,
+			Object:  "model",
+			Created: 0,
+			OwnedBy: "trae",
+		})
 	}
 	s.auth.mu.Lock()
 	defer s.auth.mu.Unlock()
@@ -172,7 +233,10 @@ func (s *server) models(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 401, errLoginRequired.Error())
 		return
 	}
-	writeJSON(w, 200, pagination.Page[openai.Model]{Object: "list", Data: models})
+	writeJSON(w, 200, pagination.Page[openai.Model]{
+		Object: "list",
+		Data:   models,
+	})
 }
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
@@ -248,11 +312,22 @@ func writeError(w http.ResponseWriter, status int, detail string) {
 	if status == 401 {
 		typ = "authentication_error"
 	}
-	writeJSON(w, status, openAIErrorJSON{detail: openai.Error{Message: detail, Type: typ}, includeCode: true})
+	writeJSON(w, status, openAIErrorJSON{
+		detail: openai.Error{
+			Message: detail,
+			Type:    typ,
+		},
+		includeCode: true,
+	})
 }
 func (s *server) writeExecutionError(w http.ResponseWriter, sink *streamSink, e error) {
 	if sink != nil && sink.hasStarted() {
-		_ = sink.send("", openAIErrorJSON{detail: openai.Error{Message: e.Error(), Type: "server_error"}})
+		_ = sink.send("", openAIErrorJSON{
+			detail: openai.Error{
+				Message: e.Error(),
+				Type:    "server_error",
+			},
+		})
 		_ = sink.done()
 		return
 	}
@@ -289,24 +364,34 @@ func estimateTokens(text string) int {
 func estimatedUsage(r chatRequest, c completion) *usage {
 	in := estimateTokens(jsonText(r.Messages) + jsonText(r.Tools))
 	out := estimateTokens(c.Message.Content + c.Reasoning + jsonText(c.Message.ToolCalls))
-	return &usage{Input: in, Output: out, Total: in + out}
+	return &usage{
+		Input:  in,
+		Output: out,
+		Total:  in + out,
+	}
 }
 
 // All writes, including timed heartbeats, use the same mutex. The heartbeat
 // goroutine is joined before the handler returns or writes a terminal frame.
 type streamSink struct {
-	mu                sync.Mutex
-	w                 http.ResponseWriter
-	r                 *http.Request
-	started, finished bool
-	err               error
-	stop              chan struct{}
-	doneCh            chan struct{}
-	once              sync.Once
+	mu       sync.Mutex
+	w        http.ResponseWriter
+	r        *http.Request
+	started  bool
+	finished bool
+	err      error
+	stop     chan struct{}
+	doneCh   chan struct{}
+	once     sync.Once
 }
 
 func newStreamSink(w http.ResponseWriter, r *http.Request) *streamSink {
-	s := &streamSink{w: w, r: r, stop: make(chan struct{}), doneCh: make(chan struct{})}
+	s := &streamSink{
+		w:      w,
+		r:      r,
+		stop:   make(chan struct{}),
+		doneCh: make(chan struct{}),
+	}
 	go func() {
 		defer close(s.doneCh)
 		ticker := time.NewTicker(15 * time.Second)
@@ -324,7 +409,11 @@ func newStreamSink(w http.ResponseWriter, r *http.Request) *streamSink {
 	}()
 	return s
 }
-func (s *streamSink) hasStarted() bool { s.mu.Lock(); defer s.mu.Unlock(); return s.started }
+func (s *streamSink) hasStarted() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.started
+}
 func (s *streamSink) writeLocked(event string, v any) error {
 	if s.err != nil {
 		return s.err
@@ -393,5 +482,14 @@ func (s *streamSink) done() error {
 	}
 	return s.err
 }
-func (s *streamSink) finish() { s.mu.Lock(); s.finished = true; s.mu.Unlock() }
-func (s *streamSink) close()  { s.once.Do(func() { close(s.stop); <-s.doneCh }) }
+func (s *streamSink) finish() {
+	s.mu.Lock()
+	s.finished = true
+	s.mu.Unlock()
+}
+func (s *streamSink) close() {
+	s.once.Do(func() {
+		close(s.stop)
+		<-s.doneCh
+	})
+}

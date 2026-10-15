@@ -31,7 +31,12 @@ func TestStringAuthCodeTriggersSingleRefresh(t *testing.T) {
 	cfg.AuthBaseURL = up.URL
 	s, _ := newServer(cfg)
 	defer s.shutdown()
-	s.auth.cred = credential{Token: "old", RefreshToken: "refresh", UserID: "u", ClientID: cfg.ClientID}
+	s.auth.cred = credential{
+		Token:        "old",
+		RefreshToken: "refresh",
+		UserID:       "u",
+		ClientID:     cfg.ClientID,
+	}
 	c, g := s.auth.snapshot()
 	names, err := s.upstream.modelNames(context.Background(), c, g)
 	if err != nil || strings.Join(names, ",") != "ok" || lists != 2 || refreshes != 1 {
@@ -55,13 +60,22 @@ func TestModelDiscoveryCannotPublishAfterAccountSwitch(t *testing.T) {
 	cfg.BaseURL = up.URL
 	s, _ := newServer(cfg)
 	defer s.shutdown()
-	s.auth.cred = credential{Token: "A", UserID: "A"}
+	s.auth.cred = credential{
+		Token:  "A",
+		UserID: "A",
+	}
 	c, g := s.auth.snapshot()
 	done := make(chan error, 1)
-	go func() { _, err := s.upstream.modelNamesAttempt(context.Background(), c, g); done <- err }()
+	go func() {
+		_, err := s.upstream.modelNamesAttempt(context.Background(), c, g)
+		done <- err
+	}()
 	<-started
 	s.auth.mu.Lock()
-	s.auth.cred = credential{Token: "B", UserID: "B"}
+	s.auth.cred = credential{
+		Token:  "B",
+		UserID: "B",
+	}
 	s.auth.generation++
 	s.auth.mu.Unlock()
 	close(release)
@@ -90,7 +104,10 @@ func TestFilteredBatchFallsBackToDetail(t *testing.T) {
 	cfg.BaseURL = up.URL
 	s, _ := newServer(cfg)
 	defer s.shutdown()
-	s.auth.cred = credential{Token: "test", UserID: "test"}
+	s.auth.cred = credential{
+		Token:  "test",
+		UserID: "test",
+	}
 	names, err := s.upstream.modelNamesAttempt(context.Background(), s.auth.cred, 0)
 	if err != nil || strings.Join(names, ",") != "available" || details != 4 {
 		t.Fatalf("models=%v err=%v details=%d", names, err, details)
@@ -99,13 +116,23 @@ func TestFilteredBatchFallsBackToDetail(t *testing.T) {
 
 func TestDeviceExchangeNetworkFailureDoesNotTrySecondClient(t *testing.T) {
 	var attempts int
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { attempts++; w.WriteHeader(500) }))
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(500)
+	}))
 	defer up.Close()
 	cfg := fixtureConfig()
 	cfg.AuthBaseURL = up.URL
 	a, _ := newAuthManager(cfg)
 	key, _ := newDeviceKey()
-	_, err := a.exchange(context.Background(), credential{Token: "old", RefreshToken: "r", UserID: "u", DeviceID: "1234567890123456789", MachineID: "machine", DeviceKey: key})
+	_, err := a.exchange(context.Background(), credential{
+		Token:        "old",
+		RefreshToken: "r",
+		UserID:       "u",
+		DeviceID:     "1234567890123456789",
+		MachineID:    "machine",
+		DeviceKey:    key,
+	})
 	if err == nil || attempts != 1 {
 		t.Fatalf("uncertain exchange retried: attempts=%d err=%v", attempts, err)
 	}
@@ -137,7 +164,10 @@ func TestModelFallbackPartialAndNoAuthFallback(t *testing.T) {
 	cfg.BaseURL = up.URL
 	s, _ := newServer(cfg)
 	defer s.shutdown()
-	s.auth.cred = credential{Token: "x", UserID: "u"}
+	s.auth.cred = credential{
+		Token:  "x",
+		UserID: "u",
+	}
 	c, g, _ := s.auth.get(context.Background())
 	names, err := s.upstream.modelNames(context.Background(), c, g)
 	if err != nil || strings.Join(names, ",") != "ok" || batch != 1 || details != 4 {
@@ -165,7 +195,15 @@ func TestBoundRefreshNeverFallsBackToLegacy(t *testing.T) {
 	cfg.AuthBaseURL = up.URL
 	a, _ := newAuthManager(cfg)
 	key, _ := newDeviceKey()
-	a.cred = credential{Token: "old", RefreshToken: "refresh", UserID: "u", DeviceID: "1234567890123456789", MachineID: "machine", DeviceKey: key, ExpiresAt: time.Now().Add(-time.Second)}
+	a.cred = credential{
+		Token:        "old",
+		RefreshToken: "refresh",
+		UserID:       "u",
+		DeviceID:     "1234567890123456789",
+		MachineID:    "machine",
+		DeviceKey:    key,
+		ExpiresAt:    time.Now().Add(-time.Second),
+	}
 	if _, _, err := a.get(context.Background()); err != errLoginRequired || bound != 2 || legacy != 0 {
 		t.Fatalf("err=%v bound=%d legacy=%d", err, bound, legacy)
 	}
@@ -190,8 +228,13 @@ func TestEmptyBatchFallsBackToDetail(t *testing.T) {
 	cfg.BaseURL = up.URL
 	s, _ := newServer(cfg)
 	defer s.shutdown()
-	s.auth.cred = credential{Token: "test", UserID: "test"}
-	names, err := s.upstream.modelNamesAttempt(context.Background(), credential{Token: "test"}, 0)
+	s.auth.cred = credential{
+		Token:  "test",
+		UserID: "test",
+	}
+	names, err := s.upstream.modelNamesAttempt(context.Background(), credential{
+		Token: "test",
+	}, 0)
 	if err != nil || strings.Join(names, ",") != "only-detail" || detail != 4 {
 		t.Fatalf("names=%v detail=%d err=%v", names, detail, err)
 	}
@@ -206,8 +249,13 @@ func TestMaxWindowFromAnotherFunctionEntry(t *testing.T) {
 	cfg.BaseURL = up.URL
 	s, _ := newServer(cfg)
 	defer s.shutdown()
-	s.auth.cred = credential{Token: "test", UserID: "test"}
-	names, err := s.upstream.modelNamesAttempt(context.Background(), credential{Token: "test"}, 0)
+	s.auth.cred = credential{
+		Token:  "test",
+		UserID: "test",
+	}
+	names, err := s.upstream.modelNamesAttempt(context.Background(), credential{
+		Token: "test",
+	}, 0)
 	if err != nil || strings.Join(names, ",") != "m,m-max" || s.upstream.routes["m-max"].window != 4000 || s.upstream.routes["m-max"].function != "chat_v3" {
 		t.Fatalf("names=%v err=%v max=%+v", names, err, s.upstream.routes["m-max"])
 	}
@@ -222,8 +270,14 @@ func TestPartialDeviceBindingCannotDowngrade(t *testing.T) {
 	cfg.AuthBaseURL = up.URL
 	a, _ := newAuthManager(cfg)
 	for _, c := range []credential{
-		{RefreshToken: "refresh", DeviceID: "1234567890123456789"},
-		{RefreshToken: "refresh", MachineID: "machine"},
+		{
+			RefreshToken: "refresh",
+			DeviceID:     "1234567890123456789",
+		},
+		{
+			RefreshToken: "refresh",
+			MachineID:    "machine",
+		},
 	} {
 		_, err := a.exchange(context.Background(), c)
 		if err != errLoginRequired {

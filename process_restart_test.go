@@ -58,7 +58,10 @@ func TestTRAE003BinaryRestartAndLegacyFiles(t *testing.T) {
 			t.Fatal(err)
 		}
 		done := make(chan struct{})
-		go func() { _ = cmd.Wait(); close(done) }()
+		go func() {
+			_ = cmd.Wait()
+			close(done)
+		}()
 		var once sync.Once
 		stop := func() {
 			once.Do(func() {

@@ -37,16 +37,56 @@ func TestTRAE003ChatFullHistoryToolRoundTrip(t *testing.T) {
 			cfg := fixtureConfig()
 			cfg.BaseURL = up.URL
 			s := authenticatedServer(t, cfg)
-			first := callAPI(t, s, "/v1/chat/completions", map[string]any{"stream": stream, "tools": []tool{fileTool()}, "messages": []message{{Role: "user", Content: "original"}}}, "")
+			first := callAPI(t, s, "/v1/chat/completions", map[string]any{"stream": stream, "tools": []tool{fileTool()}, "messages": []message{{
+				Role:    "user",
+				Content: "original",
+			}}}, "")
 			if first.Code != 200 || !strings.Contains(first.Body.String(), "reasoning_content") || !strings.Contains(first.Body.String(), "tool_calls") {
 				t.Fatal(first.Body.String())
 			}
-			history := []message{{Role: "user", Content: "original"}, {Role: "assistant", ToolCalls: []toolCall{{ID: "a", Type: "function", Function: function{Name: "read_file", Arguments: "{}"}}, {ID: "b", Type: "function", Function: function{Name: "read_file", Arguments: "{}"}}}}, {Role: "tool", ToolCallID: "a", Content: "result A"}, {Role: "tool", ToolCallID: "b", Content: "result B"}}
-			second := callAPI(t, s, "/v1/chat/completions", map[string]any{"model": "m", "stream": stream, "tools": []tool{fileTool()}, "messages": history}, "")
+			history := []message{{
+				Role:    "user",
+				Content: "original",
+			}, {
+				Role: "assistant",
+				ToolCalls: []toolCall{{
+					ID:   "a",
+					Type: "function",
+					Function: function{
+						Name:      "read_file",
+						Arguments: "{}",
+					},
+				}, {
+					ID:   "b",
+					Type: "function",
+					Function: function{
+						Name:      "read_file",
+						Arguments: "{}",
+					},
+				}},
+			}, {
+				Role:       "tool",
+				ToolCallID: "a",
+				Content:    "result A",
+			}, {
+				Role:       "tool",
+				ToolCallID: "b",
+				Content:    "result B",
+			}}
+			second := callAPI(t, s, "/v1/chat/completions", map[string]any{
+				"model":    "m",
+				"stream":   stream,
+				"tools":    []tool{fileTool()},
+				"messages": history,
+			}, "")
 			if second.Code != 200 || !strings.Contains(second.Body.String(), "verified") || turns != 2 {
 				t.Fatalf("turns=%d body=%s", turns, second.Body.String())
 			}
-			incomplete := callAPI(t, s, "/v1/chat/completions", map[string]any{"model": "m", "messages": []message{{Role: "tool", ToolCallID: "a", Content: "only result"}}}, "same")
+			incomplete := callAPI(t, s, "/v1/chat/completions", map[string]any{"model": "m", "messages": []message{{
+				Role:       "tool",
+				ToolCallID: "a",
+				Content:    "only result",
+			}}}, "same")
 			if incomplete.Code != 400 || turns != 2 {
 				t.Fatal("incremental tool history accepted")
 			}

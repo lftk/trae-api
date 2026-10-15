@@ -26,7 +26,12 @@ func TestTRAE001TransientRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.cred = credential{Token: "still-valid", RefreshToken: "fixture-refresh", UserID: "account", ExpiresAt: time.Now().Add(time.Minute)}
+	a.cred = credential{
+		Token:        "still-valid",
+		RefreshToken: "fixture-refresh",
+		UserID:       "account",
+		ExpiresAt:    time.Now().Add(time.Minute),
+	}
 	for i := 0; i < 2; i++ {
 		c, _, err := a.get(context.Background())
 		if err != nil || c.Token != "still-valid" {
