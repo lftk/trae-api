@@ -76,14 +76,8 @@ func newCommand() *cli.Command {
 				Action: func(ctx context.Context, cmd *cli.Command) error { return runAPIOnly(ctx, commandConfig(cmd)) },
 			},
 			{
-				Name:   "auth",
-				Usage:  "Start only the browser authorization service",
-				Flags:  []cli.Flag{authAddrFlag()},
-				Action: func(ctx context.Context, cmd *cli.Command) error { return runAuthOnly(ctx, commandConfig(cmd)) },
-			},
-			{
 				Name:  "login",
-				Usage: "Log in through the local authorization service",
+				Usage: "Log in and keep Auth renewal in the foreground, or reuse active Auth",
 				Flags: []cli.Flag{authAddrFlag()},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
 					c := commandConfig(cmd)

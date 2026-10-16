@@ -10,14 +10,6 @@ func runAPIOnly(ctx context.Context, c config) error {
 	return runCurrent(ctx, c)
 }
 
-func runAuthOnly(ctx context.Context, c config) error {
-	auth, err := newAuthService(c, c.AuthAddr)
-	if err != nil {
-		return err
-	}
-	return auth.Run(ctx)
-}
-
 func runCombined(ctx context.Context, c config) error {
 	auth, err := newAuthService(c, c.AuthAddr)
 	if err != nil {
