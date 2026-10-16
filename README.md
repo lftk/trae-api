@@ -1,6 +1,6 @@
 # trae-api
 
-单账号 Trae CN → OpenAI Chat Completions 网关。API 与 Auth 独立运行，默认在同一进程协调启动；Auth 维护固定凭证文件，API 只读访问快照。对话无状态，不执行客户端工具。
+单账号 Trae CN → OpenAI Chat Completions 网关。API 与 Auth 职责独立，默认同进程运行；`login` 可直接启动所需 Auth，无须先启动另一命令。Auth 维护固定凭证文件，API 只读访问快照。对话无状态，不执行客户端工具。
 
 > 当前为按用户指示合并的开发快照，独立复核未通过。刷新取消和发送前栅栏写失败仍有已知边界问题，见 [已知问题](docs/KNOWN_ISSUES.md)；不得把合并或测试绿灯当作验收通过。
 
@@ -10,22 +10,22 @@ Go 1.25+，在仓库根目录：
 
 ```bash
 go build -o trae-api .
-./trae-api             # 同进程启动 API :8723 与 loopback Auth :8765
-./trae-api login       # 另一个终端：联系 Auth 打开官方授权页
-./trae-api api         # 或只启动 API
-./trae-api auth        # 或只启动 Auth
-./trae-api --help
-./trae-api login --help
+# 全新机器：终端一直接授权，成功后保持这个进程在前台执行续期
+./trae-api login
+# 终端二：启动只读凭证快照的 API
+./trae-api api
 ```
 
-命令分发、参数、帮助和版本由 `urfave/cli/v3` 处理。API 默认 `127.0.0.1:8723`，Auth 默认 `127.0.0.1:8765`；回调使用 Auth 实际绑定的 loopback 地址，不通过 API。CLI 不偷偷启动后台服务；Auth 从自己写出的有效凭证状态恢复，过期、失效或刷新状态不确定时可能需要重新登录。尚未发布安装包，不保证旧 Homebrew 包含当前源码行为。
+或者终端一直接运行 `./trae-api`（API 与 Auth 同进程），再在终端二运行 `./trae-api login`；后者验证并复用已有 Auth，授权结束即可退出。查看命令：`./trae-api --help`、`./trae-api login --help`。
+
+命令分发、参数、帮助和版本由 `urfave/cli/v3` 处理。API 默认 `127.0.0.1:8723`，Auth 默认 `127.0.0.1:8765`；回调使用 Auth 实际绑定的 loopback 地址，不通过 API。无独立 `auth` 命令或别名。`login` 若自行启动 Auth，授权完成后仍占用当前终端并负责续期，Ctrl+C 停止后 API-only 只能读取现有令牌直到失效；如默认进程已运行 Auth，`login` 经本机实例校验后安全复用并在授权后退出。端口由其他程序占用会明确报错，不会把普通健康页当作 Auth；不创建后台守护进程。Auth 从有效凭证状态恢复，过期、失效或刷新状态不确定时可能需要重新登录。尚未发布安装包，不保证旧 Homebrew 包含当前源码行为。
 
 ## 配置
 
 参数由 CLI 库读取，以各子命令 `--help` 为准：
 
 - `--api-addr` / `TRAE_API_ADDR`：API 地址，默认 `127.0.0.1:8723`，非回环监听必须配置网关 Token。
-- `--auth-addr` / `TRAE_API_AUTH_ADDR`：Auth 地址，默认 `127.0.0.1:8765`，只允许 loopback；也供 login 使用。
+- `--auth-addr` / `TRAE_API_AUTH_ADDR`：Auth 回环地址，默认 `127.0.0.1:8765`，供默认进程和 `login` 自启或安全复用使用。
 - `--api-token`：网关 Token 参数；真实秘密优先从 `TRAE_API_TOKEN` 环境变量读取，避免出现在进程参数中。
 - `TRAE_API_TOKEN`：默认空；设置后 API 请求需 `Authorization: Bearer <gateway-token>`。login 只联系本机 Auth，不发送此网关 Token。
 

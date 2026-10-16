@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -18,6 +21,7 @@ import (
 // addr is separate from config until the coordinator supplies its Auth address.
 type authService struct {
 	addr        string
+	instanceKey []byte
 	manager     *authManager
 	store       *credentialStore
 	ctx         context.Context
@@ -83,6 +87,12 @@ func (a *authService) listen() (net.Listener, error) {
 		l.Close()
 		return nil, errors.New("Auth listener must bind loopback TCP")
 	}
+	key, err := a.store.PublishAuthInstance(l.Addr().String())
+	if err != nil {
+		l.Close()
+		return nil, fmt.Errorf("publish Auth listener identity: %w", err)
+	}
+	a.instanceKey = key
 	callback := "http://" + net.JoinHostPort(tcp.IP.String(), strconv.Itoa(tcp.Port)) + "/authorize"
 	a.manager.mu.Lock()
 	a.manager.callbackURL = callback
@@ -115,6 +125,16 @@ func (a *authService) routes() http.Handler {
 		if r.URL.EscapedPath() != "/authorize" && !sameOrigin(r) {
 			writeError(w, 403, "cross-origin management request denied")
 			return
+		}
+		if encoded := r.Header.Get("X-Trae-Auth-Challenge"); encoded != "" {
+			challenge, err := hex.DecodeString(encoded)
+			if err != nil || len(challenge) != 32 {
+				writeError(w, 400, "invalid Auth challenge")
+				return
+			}
+			mac := hmac.New(sha256.New, a.instanceKey)
+			mac.Write(challenge)
+			w.Header().Set("X-Trae-Auth-Proof", hex.EncodeToString(mac.Sum(nil)))
 		}
 		mux.ServeHTTP(w, r)
 	})

@@ -20,11 +20,7 @@ func TestTRAE008CLILibraryHelpAndCommands(t *testing.T) {
 			args:     []string{"trae-api", "--help"},
 			expected: "api",
 		},
-		{
-			name:     "auth help",
-			args:     []string{"trae-api", "auth", "--help"},
-			expected: "authorization",
-		},
+
 		{
 			name:     "api help",
 			args:     []string{"trae-api", "api", "--help"},
@@ -56,6 +52,21 @@ func TestTRAE008CLILibraryHelpAndCommands(t *testing.T) {
 	}
 }
 
+func TestTRAE009OnlyLoginExposesAuthorization(t *testing.T) {
+	app := newCommand()
+	if app.Command("auth") != nil {
+		t.Fatal("duplicate public auth command remains")
+	}
+	var out bytes.Buffer
+	app.Writer = &out
+	if err := app.Run(context.Background(), []string{"trae-api", "--help"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "login") || strings.Contains(out.String(), "Start only the browser authorization service") {
+		t.Fatalf("obsolete Auth entry in help: %s", out.String())
+	}
+}
+
 func TestTRAE008CLIFlagSourcesAndLibraryDispatch(t *testing.T) {
 	t.Setenv("TRAE_API_ADDR", "127.0.0.1:10001")
 	t.Setenv("TRAE_API_AUTH_ADDR", "127.0.0.1:10002")
@@ -75,8 +86,8 @@ func TestTRAE008CLIFlagSourcesAndLibraryDispatch(t *testing.T) {
 			token:    "synthetic-gateway",
 		},
 		{
-			name:     "auth only its address",
-			args:     []string{"trae-api", "auth"},
+			name:     "login only its Auth address",
+			args:     []string{"trae-api", "login"},
 			apiAddr:  "127.0.0.1:8723",
 			authAddr: "127.0.0.1:10002",
 		},

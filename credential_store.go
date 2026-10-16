@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -37,6 +38,14 @@ type storedCredential struct {
 	credential
 	Version          int    `json:"version"`
 	DevicePrivateKey string `json:"device_private_key"`
+}
+
+// The stable writer-lock file also identifies its active Auth listener. It is
+// not an API credential; login reads it only to verify an already running Auth.
+type authInstance struct {
+	Version int    `json:"version"`
+	Address string `json:"address"`
+	Key     string `json:"key"`
 }
 
 // credentialStore owns the sole writer lock for its entire lifetime. Never
@@ -129,6 +138,60 @@ func (s *credentialStore) Close() error {
 		return err
 	}
 	return closeErr
+}
+
+func (s *credentialStore) PublishAuthInstance(addr string) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lock == nil {
+		return nil, errors.New("credential store closed")
+	}
+	var key [32]byte
+	if _, err := rand.Read(key[:]); err != nil {
+		return nil, err
+	}
+	data, err := json.Marshal(authInstance{
+		Version: 1,
+		Address: addr,
+		Key:     hex.EncodeToString(key[:]),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := s.lock.Truncate(0); err != nil {
+		return nil, err
+	}
+	if _, err := s.lock.WriteAt(data, 0); err != nil {
+		return nil, err
+	}
+	if err := s.lock.Sync(); err != nil {
+		return nil, err
+	}
+	return key[:], nil
+}
+
+func readAuthInstance() (authInstance, []byte, error) {
+	path, err := credentialPath()
+	if err != nil {
+		return authInstance{}, nil, err
+	}
+	data, err := readCredentialFile(path + ".lock")
+	if err != nil {
+		return authInstance{}, nil, err
+	}
+	if len(data) > 512 {
+		return authInstance{}, nil, errors.New("invalid Auth instance marker")
+	}
+	var marker authInstance
+	if err := decodeCredential(data, &marker, true); err != nil {
+		return authInstance{}, nil, err
+	}
+	key, err := hex.DecodeString(marker.Key)
+	host, port, addressErr := net.SplitHostPort(marker.Address)
+	if err != nil || len(key) != 32 || marker.Version != 1 || addressErr != nil || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() || port == "0" {
+		return authInstance{}, nil, errors.New("invalid Auth instance marker")
+	}
+	return marker, key, nil
 }
 
 // readCredentialFile checks file metadata on the opened descriptor, so rename
